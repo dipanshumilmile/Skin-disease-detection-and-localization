@@ -1,1394 +1,2936 @@
-'use client';
 
-import { useEffect, useRef, useState } from 'react';
-import LesionPhoto from '../ui/LesionPhoto';
+"use client";
 
-const ACCEPTED_TYPES = [
-  'image/jpeg',
-  'image/jpg',
-  'image/png',
-  'image/webp',
-];
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
+const API_URL = (
+  process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000"
+).replace(/\/$/, "");
 
-const OVERLAYS = [
-  { key: 'heat', label: 'Grad-CAM' },
-  { key: 'mask', label: 'U-Net mask' },
-  { key: 'box', label: 'Bounding box' },
-];
+const IMAGE_SIZE = 224;
+const MAX_FILE_SIZE = 10 * 1024 * 1024;
 
-const EMPTY_RESULT = {
-  prediction: null,
-  confidence: null,
-  probabilities: [],
-  localization: [],
-  gradcamUrl: null,
-  maskUrl: null,
-  boundingBox: null,
-  overlap: null,
-  inferenceTime: null,
-};
-
-/*
-Expected backend response.
-
-Later your FastAPI backend should return something similar to:
-
-{
-  "prediction": "Basal Cell Carcinoma",
-  "confidence": 94.2,
-
-  "probabilities": [
-    {
-      "label": "Basal Cell Carcinoma",
-      "pct": 94.2
-    },
-    {
-      "label": "Melanoma",
-      "pct": 2.1
-    },
-    {
-      "label": "Melanocytic Nevi",
-      "pct": 2.4
-    },
-    {
-      "label": "Warts, Molluscum and other Viral Infections",
-      "pct": 1.3
-    }
-  ],
-
-  "localization": [
-    {
-      "label": "Lesion area",
-      "value": "31.4%"
-    },
-    {
-      "label": "Bounding box",
-      "value": "126 × 119 px"
-    },
-    {
-      "label": "Mask confidence",
-      "value": "91.7%"
-    },
-    {
-      "label": "IoU with Grad-CAM",
-      "value": "71.0%"
-    }
-  ],
-
-  "gradcam_url": "/results/gradcam/abc.png",
-  "mask_url": "/results/mask/abc.png",
-
-  "bounding_box": {
-    "x": 42,
-    "y": 31,
-    "width": 126,
-    "height": 119
+const VIEW_OPTIONS = [
+  { id: "gradcam", label: "Grad-CAM", description: "Model attention heatmap" },
+  { id: "binary-mask", label: "Binary Mask", description: "U-Net lesion mask" },
+  {
+    id: "bounding-box",
+    label: "Bounding Box",
+    description: "Lesion boundary localization",
   },
+];
 
-  "overlap": 71.0,
+const DEFAULT_VIEWS = ["gradcam", "binary-mask", "bounding-box"];
 
-  "inference_time": 2.1
+function makeBackendUrl(url) {
+  if (!url) return null;
+
+  if (
+    url.startsWith("http://") ||
+    url.startsWith("https://") ||
+    url.startsWith("blob:")
+  ) {
+    return url;
+  }
+
+  if (url.startsWith("/")) return `${API_URL}${url}`;
+
+  return `${API_URL}/${url}`;
 }
-*/
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function formatPercent(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${number.toFixed(2)}%` : "—";
+}
+
+function formatNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toLocaleString() : "—";
+}
+
+function formatConfidence(value) {
+  const number = Number(value);
+
+  if (!Number.isFinite(number)) return "—";
+
+  return `${(number <= 1 ? number * 100 : number).toFixed(2)}%`;
+}
+
+function normalizeResult(data, fileName, startedAt) {
+  const classification = data.classification || {};
+  const localization = data.localization || {};
+
+  const confidence = Number(
+    classification.confidence ?? data.confidence ?? 0
+  );
+
+  return {
+    scanId: data.scan_id ?? data.scanId ?? null,
+    fileName: data.file_name ?? data.fileName ?? fileName,
+    prediction:
+      classification.className ??
+      data.prediction ??
+      data.className ??
+      "Unknown",
+    confidence,
+    probabilities:
+      classification.probabilities ?? data.probabilities ?? {},
+    gradcamUrl: makeBackendUrl(data.gradcam ?? data.gradcamUrl),
+    localization: {
+      ...localization,
+      mask: makeBackendUrl(localization.mask ?? data.mask),
+      areaPixels: localization.areaPixels ?? data.areaPixels ?? null,
+      areaAffectedPercent:
+        localization.areaAffectedPercent ??
+        data.areaAffectedPercent ??
+        null,
+      perimeterPixels:
+        localization.perimeterPixels ?? data.perimeterPixels ?? null,
+      bbox: localization.bbox ?? data.bbox ?? null,
+    },
+    inferenceTime:
+      data.inference_time ??
+      data.inferenceTime ??
+      data.processing_time_ms ??
+      Date.now() - startedAt,
+  };
+}
+
+function Icon({ name, size = 18 }) {
+  const common = {
+    width: size,
+    height: size,
+    viewBox: "0 0 24 24",
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 1.8,
+    strokeLinecap: "round",
+    strokeLinejoin: "round",
+    "aria-hidden": true,
+  };
+
+  const paths = {
+    upload: (
+      <>
+        <path d="M12 16V4" />
+        <path d="m7 9 5-5 5 5" />
+        <path d="M20 16.5v2A1.5 1.5 0 0 1 18.5 20h-13A1.5 1.5 0 0 1 4 18.5v-2" />
+      </>
+    ),
+    image: (
+      <>
+        <rect x="3" y="3" width="18" height="18" rx="3" />
+        <circle cx="8.5" cy="8.5" r="1.5" />
+        <path d="m21 15-5-5L5 21" />
+      </>
+    ),
+    scan: (
+      <>
+        <path d="M4 8V5a1 1 0 0 1 1-1h3" />
+        <path d="M16 4h3a1 1 0 0 1 1 1v3" />
+        <path d="M20 16v3a1 1 0 0 1-1 1h-3" />
+        <path d="M8 20H5a1 1 0 0 1-1-1v-3" />
+        <circle cx="12" cy="12" r="4" />
+      </>
+    ),
+    zoomIn: (
+      <>
+        <circle cx="10.5" cy="10.5" r="6.5" />
+        <path d="m16 16 4 4M10.5 7.5v6M7.5 10.5h6" />
+      </>
+    ),
+    zoomOut: (
+      <>
+        <circle cx="10.5" cy="10.5" r="6.5" />
+        <path d="m16 16 4 4M7.5 10.5h6" />
+      </>
+    ),
+    reset: (
+      <>
+        <path d="M3 11a9 9 0 1 1 2.64 6.36" />
+        <path d="M3 4v7h7" />
+      </>
+    ),
+    close: (
+      <>
+        <path d="m18 6-12 12M6 6l12 12" />
+      </>
+    ),
+    check: <path d="m5 12 4 4L19 6" />,
+    clock: (
+      <>
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 7v5l3 2" />
+      </>
+    ),
+    download: (
+      <>
+        <path d="M12 3v12" />
+        <path d="m7 10 5 5 5-5" />
+        <path d="M5 20h14" />
+      </>
+    ),
+    flag: (
+      <>
+        <path d="M5 21V4" />
+        <path d="M5 4h12l-2 4 2 4H5" />
+      </>
+    ),
+    alert: (
+      <>
+        <path d="m10.3 3.9-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.7-3.1l-8-14a2 2 0 0 0-3.4 0Z" />
+        <path d="M12 9v4M12 17h.01" />
+      </>
+    ),
+    sparkles: (
+      <>
+        <path d="m12 3 1.9 5.8L20 11l-6.1 2.2L12 19l-2-5.8L4 11l6-2.2L12 3Z" />
+        <path d="m19 14 1.2 2.8L23 18l-2.8 1.1L19 22l-1.1-2.9L15 18l2.9-1.2L19 14Z" />
+      </>
+    ),
+  };
+
+  return <svg {...common}>{paths[name] || paths.image}</svg>;
+}
+
+function ZoomControls({
+  zoom,
+  onZoomIn,
+  onZoomOut,
+  onReset,
+  compact = false,
+}) {
+  return (
+    <div
+      className={`visual-zoom-controls ${compact ? "zoom-controls-compact" : ""}`}
+      onClick={(event) => event.stopPropagation()}
+      role="group"
+      aria-label="Image zoom controls"
+    >
+      <button
+        type="button"
+        onClick={onZoomOut}
+        disabled={zoom <= 1}
+        title="Zoom out"
+        aria-label="Zoom out"
+      >
+        <Icon name="zoomOut" size={16} />
+      </button>
+
+      <span className="zoom-percentage">{Math.round(zoom * 100)}%</span>
+
+      <button
+        type="button"
+        onClick={onZoomIn}
+        disabled={zoom >= 3}
+        title="Zoom in"
+        aria-label="Zoom in"
+      >
+        <Icon name="zoomIn" size={16} />
+      </button>
+
+      <button
+        type="button"
+        onClick={onReset}
+        disabled={zoom === 1}
+        title="Reset zoom"
+        aria-label="Reset zoom"
+        className="zoom-reset-button"
+      >
+        <Icon name="reset" size={14} />
+        <span>Reset</span>
+      </button>
+    </div>
+  );
+}
+
+function VisualCard({
+  cardId,
+  title,
+  subtitle,
+  imageUrl,
+  result,
+  zoom,
+  onZoomIn,
+  onZoomOut,
+  onResetZoom,
+  onOpen,
+  type = "image",
+  bbox,
+  badge,
+  isDark = false,
+}) {
+  const imageTransform = {
+    transform: `scale(${zoom})`,
+  };
+
+  return (
+    <article className="visual-card">
+      <div className="visual-card-heading">
+        <div className="visual-heading-copy">
+          <h3 className="visual-card-title">{title}</h3>
+          <p className="visual-card-subtitle">{subtitle}</p>
+        </div>
+
+        {badge && <span className="visual-badge">{badge}</span>}
+      </div>
+
+      <ZoomControls
+        zoom={zoom}
+        onZoomIn={onZoomIn}
+        onZoomOut={onZoomOut}
+        onReset={onResetZoom}
+      />
+
+      <button
+        type="button"
+        className={`visual-image-area ${type === "binary-mask" ? "binary-image-area" : ""}`}
+        onClick={() => onOpen?.({ cardId, title, imageUrl, type, bbox })}
+        aria-label={`Open ${title} in enlarged view`}
+      >
+        {imageUrl ? (
+          <div className="visual-image-zoom-stage">
+            <img
+              src={imageUrl}
+              alt={title}
+              className={`visual-image ${type === "binary-mask" ? "binary-mask-image" : ""}`}
+              style={imageTransform}
+              draggable="false"
+            />
+
+            {type === "bounding-box" && bbox && (
+              <svg
+                className="bbox-overlay"
+                viewBox={`0 0 ${IMAGE_SIZE} ${IMAGE_SIZE}`}
+                preserveAspectRatio="none"
+                aria-label="Lesion bounding box"
+              >
+                <rect
+                  x={bbox.x}
+                  y={bbox.y}
+                  width={bbox.width}
+                  height={bbox.height}
+                  fill="none"
+                  stroke="#00ff88"
+                  strokeWidth="1.8"
+                  vectorEffect="non-scaling-stroke"
+                />
+                <rect
+                  x={bbox.x}
+                  y={Math.max(0, bbox.y - 12)}
+                  width={Math.min(110, Math.max(40, bbox.width))}
+                  height="12"
+                  fill="#00ff88"
+                />
+                <text
+                  x={bbox.x + 4}
+                  y={Math.max(9, bbox.y - 3)}
+                  fill="#022c22"
+                  fontSize="7"
+                  fontWeight="bold"
+                >
+                  LESION
+                </text>
+              </svg>
+            )}
+          </div>
+        ) : (
+          <div className="visual-placeholder">
+            <Icon name="image" size={30} />
+            <span>Visualization unavailable</span>
+            <small>Run an analysis to generate this view.</small>
+          </div>
+        )}
+
+        <span className="image-expand-hint">
+          <Icon name="zoomIn" size={14} />
+          Click to enlarge
+        </span>
+      </button>
+
+      <div className="visual-card-footer">
+        <div>
+          <span className="metric-label">Inference latency</span>
+          <strong className="metric-value">
+            {result?.inferenceTime != null
+              ? `${Number(result.inferenceTime).toFixed(0)} ms`
+              : "—"}
+          </strong>
+        </div>
+
+        {type === "bounding-box" && bbox && (
+          <div className="bbox-status">
+            <span className="status-dot" />
+            Boundary detected
+          </div>
+        )}
+
+        {type === "binary-mask" && (
+          <span className="mini-tag">U-Net mask</span>
+        )}
+
+        {type === "gradcam" && (
+          <span className="mini-tag">Model attention</span>
+        )}
+      </div>
+    </article>
+  );
+}
 
 export default function AnalyzeView() {
-  // ------------------------------------------------------------
-  // Image state
-  // ------------------------------------------------------------
+  const inputRef = useRef(null);
+  const objectUrlRef = useRef(null);
+  const maskUrlRef = useRef(null);
+  const segmentedUrlRef = useRef(null);
+  const requestIdRef = useRef(0);
 
   const [selectedFile, setSelectedFile] = useState(null);
-  const [imageUrl, setImageUrl] = useState(null);
-  const [imageDimensions, setImageDimensions] = useState(null);
+  const [previewUrl, setPreviewUrl] = useState(null);
+  const [result, setResult] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [dragging, setDragging] = useState(false);
+  const [selectedViews, setSelectedViews] = useState(DEFAULT_VIEWS);
+  const [cardZoom, setCardZoom] = useState({});
+  const [lightbox, setLightbox] = useState(null);
+  const [lightboxZoom, setLightboxZoom] = useState(1);
+  const [segmentedLesionUrl, setSegmentedLesionUrl] = useState(null);
+  const [maskBbox, setMaskBbox] = useState(null);
+  const [caseOptions, setCaseOptions] = useState([]);
+  const [selectedCase, setSelectedCase] = useState("");
+  const [reviewFlagged, setReviewFlagged] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [isDark, setIsDark] = useState(false);
 
-  // ------------------------------------------------------------
-  // UI state
-  // ------------------------------------------------------------
+  useEffect(() => {
+    const root = document.documentElement;
 
-  const [overlay, setOverlay] = useState('heat');
-  const [mode, setMode] = useState('single');
-  const [isDragging, setIsDragging] = useState(false);
+    const updateTheme = () => {
+      setIsDark(
+        root.classList.contains("dark") ||
+          root.getAttribute("data-theme") === "dark" ||
+          document.body.classList.contains("dark")
+      );
+    };
 
-  // ------------------------------------------------------------
-  // Analysis state
-  // ------------------------------------------------------------
+    updateTheme();
 
-  const [result, setResult] = useState(EMPTY_RESULT);
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [error, setError] = useState(null);
+    const observer = new MutationObserver(updateTheme);
 
-  // ------------------------------------------------------------
-  // History / action state
-  // ------------------------------------------------------------
+    observer.observe(root, {
+      attributes: true,
+      attributeFilter: ["class", "data-theme"],
+    });
 
-  const [isSaving, setIsSaving] = useState(false);
-  const [isFlagging, setIsFlagging] = useState(false);
-  const [actionMessage, setActionMessage] = useState(null);
+    observer.observe(document.body, {
+      attributes: true,
+      attributeFilter: ["class", "data-theme"],
+    });
 
-  // ------------------------------------------------------------
-  // File input
-  // ------------------------------------------------------------
-
-  const fileInputRef = useRef(null);
-
-  // ------------------------------------------------------------
-  // Backend URL
-  // ------------------------------------------------------------
-
-  const API_URL =
-    process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
-
-  // ------------------------------------------------------------
-  // Cleanup object URL
-  // ------------------------------------------------------------
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     return () => {
-      if (imageUrl) {
-        URL.revokeObjectURL(imageUrl);
-      }
+      if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
+      if (maskUrlRef.current) URL.revokeObjectURL(maskUrlRef.current);
+      if (segmentedUrlRef.current) URL.revokeObjectURL(segmentedUrlRef.current);
     };
-  }, [imageUrl]);
+  }, []);
 
-  // ------------------------------------------------------------
-  // Reset analysis whenever a new image is selected
-  // ------------------------------------------------------------
+  const getCardZoom = useCallback(
+    (cardId) => cardZoom[cardId] || 1,
+    [cardZoom]
+  );
 
-  const resetAnalysis = () => {
-    setResult(EMPTY_RESULT);
-    setError(null);
-    setActionMessage(null);
-    setOverlay('heat');
-  };
+  const changeCardZoom = useCallback((cardId, amount) => {
+    setCardZoom((previous) => ({
+      ...previous,
+      [cardId]: clamp(
+        Math.round(((previous[cardId] || 1) + amount) * 100) / 100,
+        1,
+        3
+      ),
+    }));
+  }, []);
 
-  // ------------------------------------------------------------
-  // Validate image
-  // ------------------------------------------------------------
+  const resetCardZoom = useCallback((cardId) => {
+    setCardZoom((previous) => ({
+      ...previous,
+      [cardId]: 1,
+    }));
+  }, []);
 
-  const validateFile = (file) => {
-    if (!file) {
-      return 'No image was selected.';
-    }
-
-    if (!ACCEPTED_TYPES.includes(file.type)) {
-      return 'Unsupported image type. Please use JPG, JPEG, PNG, or WebP.';
-    }
-
-    if (file.size > MAX_FILE_SIZE) {
-      return 'Image is too large. Maximum allowed size is 10 MB.';
-    }
-
-    return null;
-  };
-
-  // ------------------------------------------------------------
-  // Select image
-  // ------------------------------------------------------------
-
-  const handleImageUpload = (file) => {
+  const setFile = useCallback((file) => {
     if (!file) return;
 
-    const validationError = validateFile(file);
+    const allowedTypes = [
+      "image/jpeg",
+      "image/png",
+      "image/webp",
+    ];
 
-    if (validationError) {
-      setError(validationError);
+    if (!allowedTypes.includes(file.type)) {
+      setError("Please select a JPG, JPEG, PNG, or WebP image.");
       return;
     }
 
-    setError(null);
-    setActionMessage(null);
-
-    // Revoke old object URL before replacing it.
-    if (imageUrl) {
-      URL.revokeObjectURL(imageUrl);
+    if (file.size > MAX_FILE_SIZE) {
+      setError("Image size must be 10 MB or less.");
+      return;
     }
 
-    const newImageUrl = URL.createObjectURL(file);
+    if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
+
+    const nextUrl = URL.createObjectURL(file);
+    objectUrlRef.current = nextUrl;
 
     setSelectedFile(file);
-    setImageUrl(newImageUrl);
-    setImageDimensions(null);
+    setPreviewUrl(nextUrl);
+    setResult(null);
+    setSegmentedLesionUrl(null);
+    setMaskBbox(null);
+    setError("");
+    setReviewFlagged(false);
+    setSelectedCase("");
+    setCardZoom({});
+    setLightbox(null);
+    setLightboxZoom(1);
+  }, []);
 
-    resetAnalysis();
-
-    // Read actual image dimensions.
-    const img = new Image();
-
-    img.onload = () => {
-      setImageDimensions({
-        width: img.naturalWidth,
-        height: img.naturalHeight,
-      });
-    };
-
-    img.src = newImageUrl;
-  };
-
-  // ------------------------------------------------------------
-  // File picker
-  // ------------------------------------------------------------
-
-  const handleFileChange = (event) => {
-    const file = event.target.files?.[0];
-
-    if (file) {
-      handleImageUpload(file);
-    }
-
-    // Allow selecting the same file again.
-    event.target.value = '';
-  };
-
-  // ------------------------------------------------------------
-  // Open file picker
-  // ------------------------------------------------------------
-
-  const openFilePicker = () => {
-    fileInputRef.current?.click();
-  };
-
-  // ------------------------------------------------------------
-  // Drag events
-  // ------------------------------------------------------------
-
-  const handleDragOver = (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-
-    setIsDragging(true);
-  };
-
-  const handleDragLeave = (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-
-    setIsDragging(false);
+  const handleFileInput = (event) => {
+    setFile(event.target.files?.[0]);
+    event.target.value = "";
   };
 
   const handleDrop = (event) => {
     event.preventDefault();
-    event.stopPropagation();
-
-    setIsDragging(false);
-
-    const file = event.dataTransfer.files?.[0];
-
-    if (file) {
-      handleImageUpload(file);
-    }
+    setDragging(false);
+    setFile(event.dataTransfer.files?.[0]);
   };
-
-  // ------------------------------------------------------------
-  // Remove image
-  // ------------------------------------------------------------
-
-  const handleRemoveImage = () => {
-    if (imageUrl) {
-      URL.revokeObjectURL(imageUrl);
-    }
-
-    setSelectedFile(null);
-    setImageUrl(null);
-    setImageDimensions(null);
-    setResult(EMPTY_RESULT);
-    setError(null);
-    setActionMessage(null);
-    setOverlay('heat');
-  };
-
-  // ------------------------------------------------------------
-  // Analyze image
-  // ------------------------------------------------------------
 
   const handleAnalyze = async () => {
     if (!selectedFile) {
-      setError('Please upload an image before starting analysis.');
+      setError("Upload a skin lesion image before starting the analysis.");
       return;
     }
 
-    setIsAnalyzing(true);
-    setError(null);
-    setActionMessage(null);
-    setResult(EMPTY_RESULT);
+    const currentRequest = ++requestIdRef.current;
+
+    setLoading(true);
+    setError("");
+    setResult(null);
+    setSegmentedLesionUrl(null);
+    setMaskBbox(null);
+    setCardZoom({});
+
+    const startedAt = Date.now();
+    const formData = new FormData();
+    formData.append("image", selectedFile);
 
     try {
-      const formData = new FormData();
-
-      formData.append('file', selectedFile);
-
-      /*
-       * This is the endpoint we will implement in FastAPI.
-       *
-       * POST:
-       * http://localhost:8000/predict
-       *
-       * Body:
-       * multipart/form-data
-       * file=<image>
-       */
-      const response = await fetch(`${API_URL}/predict`, {
-        method: 'POST',
+      const response = await fetch(`${API_URL}/api/analyze`, {
+        method: "POST",
         body: formData,
       });
 
+      const data = await response.json().catch(() => ({}));
+
       if (!response.ok) {
-        let message = `Analysis failed (${response.status}).`;
-
-        try {
-          const errorData = await response.json();
-
-          if (errorData?.detail) {
-            message = errorData.detail;
-          } else if (errorData?.message) {
-            message = errorData.message;
-          }
-        } catch {
-          // Keep default error message.
-        }
-
-        throw new Error(message);
+        throw new Error(
+          data.detail || data.message || "The image analysis failed."
+        );
       }
 
-      const data = await response.json();
+      if (currentRequest !== requestIdRef.current) return;
 
-      // Normalize backend response.
-      const normalizedResult = normalizeResult(data);
+      const normalized = normalizeResult(
+        data,
+        selectedFile.name,
+        startedAt
+      );
 
-      setResult(normalizedResult);
-    } catch (err) {
-      console.error('Analysis error:', err);
+      setResult(normalized);
 
-      if (
-        err instanceof TypeError &&
-        err.message.toLowerCase().includes('fetch')
-      ) {
-        setError(
-          `Backend is not connected. Start the FastAPI server at ${API_URL} and try again.`
+      try {
+        const history = JSON.parse(
+          localStorage.getItem("dermascope-history") || "[]"
         );
-      } else {
+
+        history.unshift({
+          scanId: normalized.scanId,
+          fileName: normalized.fileName,
+          prediction: normalized.prediction,
+          confidence: normalized.confidence,
+          date: new Date().toISOString(),
+        });
+
+        localStorage.setItem(
+          "dermascope-history",
+          JSON.stringify(history.slice(0, 50))
+        );
+      } catch {
+        // Analysis remains available if browser storage is disabled.
+      }
+
+      setCaseOptions((previous) => {
+        const entry = {
+          id: String(normalized.scanId ?? Date.now()),
+          fileName: normalized.fileName,
+          prediction: normalized.prediction,
+          confidence: normalized.confidence,
+          scanId: normalized.scanId,
+        };
+
+        return [
+          entry,
+          ...previous.filter((item) => item.id !== entry.id),
+        ].slice(0, 10);
+      });
+
+      setSelectedCase(String(normalized.scanId ?? ""));
+    } catch (err) {
+      if (currentRequest === requestIdRef.current) {
         setError(
-          err?.message ||
-            'Unable to analyze this image. Please try again.'
+          err.message ||
+            "Unable to connect to the analysis server. Check that your FastAPI backend is running."
         );
       }
     } finally {
-      setIsAnalyzing(false);
+      if (currentRequest === requestIdRef.current) {
+        setLoading(false);
+      }
     }
   };
 
-  // ------------------------------------------------------------
-  // Normalize backend result
-  // ------------------------------------------------------------
+  const maskUrl = result?.localization?.mask || null;
 
-  const normalizeResult = (data) => {
-    const probabilities = Array.isArray(data?.probabilities)
-      ? data.probabilities.map((item) => ({
-          label: item.label ?? item.name ?? 'Unknown',
-          pct: Number(
-            item.pct ??
-              item.probability ??
-              item.confidence ??
-              0
-          ),
-        }))
-      : [];
+  
+useEffect(() => {
+  if (!previewUrl || !maskUrl) {
+    setSegmentedLesionUrl(null);
+    setMaskBbox(null);
+    return;
+  }
 
-    const localization = Array.isArray(data?.localization)
-      ? data.localization.map((item) => ({
-          label: item.label ?? 'Metric',
-          value: item.value ?? '—',
-        }))
-      : [];
+  let cancelled = false;
+  let generatedUrl = null;
+
+  const loadImage = (src) =>
+    new Promise((resolve, reject) => {
+      const image = new Image();
+      image.crossOrigin = "anonymous";
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error(`Failed to load image: ${src}`));
+      image.src = src;
+    });
+
+  async function generateSegmentedLesion() {
+    try {
+      const [original, mask] = await Promise.all([
+        loadImage(previewUrl),
+        loadImage(maskUrl),
+      ]);
+
+      if (cancelled) return;
+
+      const size = 224;
+      const canvas = document.createElement("canvas");
+      canvas.width = size;
+      canvas.height = size;
+
+      const context = canvas.getContext("2d", {
+        willReadFrequently: true,
+      });
+
+      if (!context) throw new Error("Canvas is unavailable.");
+
+      context.drawImage(original, 0, 0, size, size);
+
+      const originalData = context.getImageData(0, 0, size, size);
+
+      const maskCanvas = document.createElement("canvas");
+      maskCanvas.width = size;
+      maskCanvas.height = size;
+
+      const maskContext = maskCanvas.getContext("2d", {
+        willReadFrequently: true,
+      });
+
+      if (!maskContext) throw new Error("Mask canvas is unavailable.");
+
+      maskContext.drawImage(mask, 0, 0, size, size);
+
+      const maskData = maskContext.getImageData(0, 0, size, size);
+
+      let minX = size;
+      let minY = size;
+      let maxX = -1;
+      let maxY = -1;
+
+      for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+          const index = (y * size + x) * 4;
+
+          const r = maskData.data[index];
+          const g = maskData.data[index + 1];
+          const b = maskData.data[index + 2];
+
+          const foreground = (r + g + b) / 3 > 127;
+
+          if (foreground) {
+            minX = Math.min(minX, x);
+            minY = Math.min(minY, y);
+            maxX = Math.max(maxX, x);
+            maxY = Math.max(maxY, y);
+          } else {
+            originalData.data[index + 3] = 0;
+          }
+        }
+      }
+
+      if (maxX < 0 || maxY < 0) {
+        throw new Error(
+          "The mask contains no white foreground pixels. Check whether your mask uses white for the lesion."
+        );
+      }
+
+      context.putImageData(originalData, 0, 0);
+
+      setMaskBbox({
+        x: minX,
+        y: minY,
+        width: maxX - minX + 1,
+        height: maxY - minY + 1,
+      });
+
+      canvas.toBlob((blob) => {
+        if (!blob || cancelled) return;
+
+        generatedUrl = URL.createObjectURL(blob);
+
+        if (segmentedUrlRef.current) {
+          URL.revokeObjectURL(segmentedUrlRef.current);
+        }
+
+        segmentedUrlRef.current = generatedUrl;
+        setSegmentedLesionUrl(generatedUrl);
+      }, "image/png");
+    } catch (error) {
+      console.error("Segmented lesion generation failed:", error);
+
+      if (!cancelled) {
+        setSegmentedLesionUrl(null);
+        setMaskBbox(null);
+      }
+    }
+  }
+
+  generateSegmentedLesion();
+
+  return () => {
+    cancelled = true;
+
+    if (generatedUrl && generatedUrl !== segmentedUrlRef.current) {
+      URL.revokeObjectURL(generatedUrl);
+    }
+  };
+}, [previewUrl, maskUrl]);
+
+
+  const bbox = useMemo(() => {
+    const source = maskBbox || result?.localization?.bbox;
+
+    if (!source) return null;
+
+    const x = clamp(
+      Number(source.x ?? source.xMin ?? 0),
+      0,
+      IMAGE_SIZE
+    );
+
+    const y = clamp(
+      Number(source.y ?? source.yMin ?? 0),
+      0,
+      IMAGE_SIZE
+    );
+
+    const rawWidth = Number(
+      source.width ??
+        Number(source.xMax ?? x) - x
+    );
+
+    const rawHeight = Number(
+      source.height ??
+        Number(source.yMax ?? y) - y
+    );
+
+    const x2 = clamp(x + Math.max(0, rawWidth), x, IMAGE_SIZE);
+    const y2 = clamp(y + Math.max(0, rawHeight), y, IMAGE_SIZE);
+
+    if (x2 <= x || y2 <= y) return null;
 
     return {
-      prediction:
-        data?.prediction ??
-        data?.predicted_class ??
-        data?.class_name ??
-        null,
-
-      confidence:
-        data?.confidence !== undefined &&
-        data?.confidence !== null
-          ? Number(data.confidence)
-          : null,
-
-      probabilities,
-
-      localization,
-
-      gradcamUrl:
-        data?.gradcam_url ??
-        data?.gradcam ??
-        data?.grad_cam_url ??
-        null,
-
-      maskUrl:
-        data?.mask_url ??
-        data?.mask ??
-        data?.unet_mask_url ??
-        null,
-
-      boundingBox:
-        data?.bounding_box ??
-        data?.bbox ??
-        null,
-
-      overlap:
-        data?.overlap !== undefined &&
-        data?.overlap !== null
-          ? Number(data.overlap)
-          : null,
-
-      inferenceTime:
-        data?.inference_time !== undefined &&
-        data?.inference_time !== null
-          ? Number(data.inference_time)
-          : null,
+      x,
+      y,
+      width: x2 - x,
+      height: y2 - y,
     };
+  }, [maskBbox, result]);
+
+  const toggleView = (id) => {
+    setSelectedViews((previous) =>
+      previous.includes(id)
+        ? previous.filter((item) => item !== id)
+        : [...previous, id]
+    );
   };
 
-  // ------------------------------------------------------------
-  // Save to history
-  // ------------------------------------------------------------
+  const openLightbox = (item) => {
+    if (!item.imageUrl) return;
 
-  const handleSaveHistory = async () => {
-    if (!selectedFile || !result.prediction) {
-      return;
-    }
+    setLightbox(item);
+    setLightboxZoom(1);
+  };
 
-    setIsSaving(true);
-    setActionMessage(null);
+  const closeLightbox = () => {
+    setLightbox(null);
+    setLightboxZoom(1);
+  };
 
-    try {
-      /*
-       * This endpoint will be implemented later in FastAPI.
-       *
-       * POST /history
-       *
-       * It can accept the original image and the analysis result.
-       */
-      const formData = new FormData();
+  useEffect(() => {
+    if (!lightbox) return;
 
-      formData.append('file', selectedFile);
-      formData.append('prediction', result.prediction);
-      formData.append(
-        'confidence',
-        String(result.confidence ?? '')
-      );
-      formData.append(
-        'result',
-        JSON.stringify(result)
-      );
+    const handleKeyDown = (event) => {
+      if (event.key === "Escape") closeLightbox();
 
-      const response = await fetch(`${API_URL}/history`, {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (!response.ok) {
-        throw new Error('Unable to save this analysis.');
+      if (event.key === "+" || event.key === "=") {
+        setLightboxZoom((zoom) => clamp(zoom + 0.25, 1, 4));
       }
 
-      setActionMessage('Analysis saved to history.');
-    } catch (err) {
-      console.error('Save history error:', err);
-
-      setActionMessage(
-        err?.message ||
-          `History backend is not connected.`
-      );
-    } finally {
-      setIsSaving(false);
-    }
-  };
-
-  // ------------------------------------------------------------
-  // Flag for manual review
-  // ------------------------------------------------------------
-
-  const handleFlagReview = async () => {
-    if (!result.prediction) {
-      return;
-    }
-
-    setIsFlagging(true);
-    setActionMessage(null);
-
-    try {
-      const response = await fetch(`${API_URL}/reviews`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          prediction: result.prediction,
-          confidence: result.confidence,
-          image_name: selectedFile?.name ?? null,
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error('Unable to flag this analysis.');
+      if (event.key === "-") {
+        setLightboxZoom((zoom) => clamp(zoom - 0.25, 1, 4));
       }
 
-      setActionMessage('Analysis flagged for manual review.');
-    } catch (err) {
-      console.error('Manual review error:', err);
+      if (event.key === "0") {
+        setLightboxZoom(1);
+      }
+    };
 
-      setActionMessage(
-        err?.message ||
-          'Review backend is not connected yet.'
+    document.addEventListener("keydown", handleKeyDown);
+
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [lightbox]);
+
+  const handleCaseChange = (event) => {
+    const id = event.target.value;
+    setSelectedCase(id);
+
+    const entry = caseOptions.find((item) => item.id === id);
+
+    if (entry) {
+      setResult((previous) =>
+        previous
+          ? {
+              ...previous,
+              scanId: entry.scanId,
+              fileName: entry.fileName,
+              prediction: entry.prediction,
+              confidence: entry.confidence,
+            }
+          : previous
       );
-    } finally {
-      setIsFlagging(false);
     }
   };
 
-  // ------------------------------------------------------------
-  // Download report
-  // ------------------------------------------------------------
+  const handleFlagForReview = () => {
+    if (!result) return;
 
-  const handleDownloadReport = async () => {
-    if (!selectedFile || !result.prediction) {
+    try {
+      const flags = JSON.parse(
+        localStorage.getItem("dermascope-review-flags") || "[]"
+      );
+
+      flags.unshift({
+        scanId: result.scanId,
+        fileName: result.fileName,
+        prediction: result.prediction,
+        confidence: result.confidence,
+        flaggedAt: new Date().toISOString(),
+      });
+
+      localStorage.setItem(
+        "dermascope-review-flags",
+        JSON.stringify(flags.slice(0, 50))
+      );
+
+      setReviewFlagged(true);
+    } catch {
+      setError("Unable to save the review flag in browser storage.");
+    }
+  };
+
+  const handleExportReport = async () => {
+    if (!result?.scanId) {
+      setError("A scan ID is required to export the PDF report.");
       return;
     }
 
+    setExporting(true);
+    setError("");
+
     try {
-      /*
-       * This endpoint will later generate the actual PDF.
-       *
-       * GET /reports/{id}
-       *
-       * For now we don't generate a fake PDF in the browser.
-       */
       const response = await fetch(
-        `${API_URL}/report`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            filename: selectedFile.name,
-            result,
-          }),
-        }
+        `${API_URL}/reports/${result.scanId}/pdf`
       );
 
       if (!response.ok) {
-        throw new Error('Report service is not available yet.');
+        throw new Error(
+          "PDF export is unavailable. Verify that your backend implements the PDF report endpoint."
+        );
       }
 
       const blob = await response.blob();
-
       const url = URL.createObjectURL(blob);
-
-      const anchor = document.createElement('a');
+      const anchor = document.createElement("a");
 
       anchor.href = url;
-      anchor.download = `dermascope-report-${Date.now()}.pdf`;
-
+      anchor.download = `dermascope-report-${result.scanId}.pdf`;
       document.body.appendChild(anchor);
-
       anchor.click();
-
       anchor.remove();
 
       URL.revokeObjectURL(url);
     } catch (err) {
-      console.error('Report error:', err);
+      setError(err.message || "Unable to export the report.");
+    } finally {
+      setExporting(false);
+    }
+  };
 
-      setActionMessage(
-        err?.message ||
-          'Report generation is not connected yet.'
+  const gradcamUrl = result?.gradcamUrl;
+  const binaryMaskUrl = result?.localization?.mask;
+
+  const renderProbabilities = () => {
+    const probabilities = result?.probabilities || {};
+    const entries = Object.entries(probabilities);
+
+    if (!entries.length) {
+      return (
+        <p className="muted-text">
+          Class probabilities were not returned by the model.
+        </p>
       );
     }
+
+    return (
+      <div className="probability-list">
+        {entries
+          .sort((a, b) => Number(b[1]) - Number(a[1]))
+          .map(([name, rawValue]) => {
+            const numericValue = Number(rawValue);
+            const fraction =
+              numericValue <= 1 ? numericValue : numericValue / 100;
+            const percent = clamp(fraction * 100, 0, 100);
+
+            return (
+              <div className="probability-row" key={name}>
+                <div className="probability-label-line">
+                  <span>{name}</span>
+                  <strong>{percent.toFixed(2)}%</strong>
+                </div>
+
+                <div className="probability-track">
+                  <div
+                    className={`probability-fill ${
+                      name === result.prediction ? "probability-fill-active" : ""
+                    }`}
+                    style={{ width: `${percent}%` }}
+                  />
+                </div>
+              </div>
+            );
+          })}
+      </div>
+    );
   };
 
-  // ------------------------------------------------------------
-  // Format confidence
-  // ------------------------------------------------------------
-
-  const formattedConfidence =
-    result.confidence !== null
-      ? `${result.confidence.toFixed(1)}%`
-      : '—';
-
-  // ------------------------------------------------------------
-  // Format inference time
-  // ------------------------------------------------------------
-
-  const formattedInferenceTime =
-    result.inferenceTime !== null
-      ? `${result.inferenceTime.toFixed(2)}s total`
-      : 'Awaiting analysis';
-
-  // ------------------------------------------------------------
-  // Bounding box style
-  // ------------------------------------------------------------
-
-  const getBoundingBoxStyle = () => {
-    if (!result.boundingBox || !imageDimensions) {
-      return {};
-    }
-
-    const box = result.boundingBox;
-
-    const left =
-      (Number(box.x ?? 0) / imageDimensions.width) * 100;
-
-    const top =
-      (Number(box.y ?? 0) / imageDimensions.height) * 100;
-
-    const width =
-      (Number(box.width ?? 0) / imageDimensions.width) * 100;
-
-    const height =
-      (Number(box.height ?? 0) / imageDimensions.height) * 100;
-
-    return {
-      left: `${left}%`,
-      top: `${top}%`,
-      width: `${width}%`,
-      height: `${height}%`,
-    };
-  };
-
-  // ------------------------------------------------------------
-  // Has result?
-  // ------------------------------------------------------------
-
-  const hasResult = Boolean(result.prediction);
+  const gridClass = `visual-grid visual-grid-${selectedViews.length}`;
 
   return (
-    <div>
+    <main className={`dermascope-analyze-page ${isDark ? "theme-dark" : ""}`}>
+      <style jsx global>{`
+        .dermascope-analyze-page {
+          --an-bg: #f7f9fc;
+          --an-surface: #ffffff;
+          --an-surface-soft: #f8fafc;
+          --an-text: #0f172a;
+          --an-muted: #64748b;
+          --an-border: #e2e8f0;
+          --an-accent: #059669;
+          --an-accent-soft: #ecfdf5;
+          --an-shadow: 0 12px 36px rgba(15, 23, 42, 0.055);
+          color: var(--an-text);
+          background: var(--an-bg);
+          min-height: 100%;
+          padding: 28px;
+          border-radius: 22px;
+          transition: background 250ms ease, color 250ms ease;
+        }
 
-      {/* ====================================================== */}
-      {/* SCREENING NOTICE */}
-      {/* ====================================================== */}
+        .dark .dermascope-analyze-page,
+        [data-theme="dark"] .dermascope-analyze-page,
+        .dermascope-analyze-page.theme-dark {
+          --an-bg: #080f1d;
+          --an-surface: #111b2d;
+          --an-surface-soft: #162237;
+          --an-text: #e5edf7;
+          --an-muted: #9aaac0;
+          --an-border: #2b3a50;
+          --an-accent: #34d399;
+          --an-accent-soft: #10372f;
+          --an-shadow: 0 12px 36px rgba(0, 0, 0, 0.2);
+        }
 
-      <div className="bg-[var(--gold-dim)] border border-[var(--line)] rounded-[3px] px-3.5 py-2.5 text-[12.5px] mb-5">
-        <strong className="text-[var(--gold)]">
-          Screening aid only
-        </strong>{' '}
-        — not a medical diagnosis. Always consult a dermatologist
-        for confirmation.
-      </div>
+        .dermascope-analyze-page *,
+        .dermascope-analyze-page *::before,
+        .dermascope-analyze-page *::after {
+          box-sizing: border-box;
+        }
 
-      {/* ====================================================== */}
-      {/* MODEL STATUS */}
-      {/* ====================================================== */}
+        .dermascope-analyze-page button,
+        .dermascope-analyze-page input,
+        .dermascope-analyze-page select {
+          font: inherit;
+        }
 
-      <div className="flex gap-2.5 mb-[18px] flex-wrap">
+        .analyze-header {
+          display: flex;
+          align-items: flex-start;
+          justify-content: space-between;
+          gap: 18px;
+          margin-bottom: 26px;
+        }
 
-        <div className="flex items-center gap-1.5 text-[12px] px-3 py-1.5 border border-[var(--line)] rounded-full bg-[var(--panel)]">
+        .analyze-kicker {
+          display: inline-flex;
+          align-items: center;
+          gap: 7px;
+          color: var(--an-accent);
+          font-size: 11px;
+          font-weight: 800;
+          letter-spacing: 0.13em;
+          text-transform: uppercase;
+          margin-bottom: 9px;
+        }
 
-          <span
-            className={`w-3.5 h-3.5 rounded-full text-white flex items-center justify-center text-[9px] ${
-              hasResult
-                ? 'bg-[var(--teal)]'
-                : 'bg-[var(--muted)]'
-            }`}
+        .analyze-title {
+          font-size: clamp(27px, 3vw, 36px);
+          line-height: 1.15;
+          font-weight: 800;
+          letter-spacing: -0.04em;
+          margin: 0;
+          color: var(--an-text);
+        }
+
+        .analyze-description {
+          color: var(--an-muted);
+          margin: 10px 0 0;
+          max-width: 690px;
+          font-size: 14px;
+          line-height: 1.7;
+        }
+
+        .analyze-header-tag {
+          flex-shrink: 0;
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          padding: 10px 13px;
+          border: 1px solid var(--an-border);
+          background: var(--an-surface);
+          border-radius: 999px;
+          color: var(--an-muted);
+          font-size: 12px;
+          font-weight: 700;
+        }
+
+        .status-dot {
+          width: 8px;
+          height: 8px;
+          border-radius: 999px;
+          background: #10b981;
+          box-shadow: 0 0 0 4px rgba(16, 185, 129, 0.12);
+          display: inline-block;
+          flex-shrink: 0;
+        }
+
+        .analyze-stack {
+          display: flex;
+          flex-direction: column;
+          gap: 22px;
+        }
+
+        .upload-card,
+        .result-card,
+        .section-card {
+          min-width: 0;
+          padding: 22px;
+          border: 1px solid var(--an-border);
+          border-radius: 22px;
+          background: var(--an-surface);
+          box-shadow: var(--an-shadow);
+          transition: background 250ms ease, border-color 250ms ease;
+        }
+
+        .section-heading {
+          display: flex;
+          justify-content: space-between;
+          align-items: flex-start;
+          gap: 14px;
+          margin-bottom: 18px;
+        }
+
+        .section-title {
+          margin: 0;
+          font-size: 18px;
+          font-weight: 800;
+          letter-spacing: -0.025em;
+          color: var(--an-text);
+        }
+
+        .section-description {
+          margin: 6px 0 0;
+          color: var(--an-muted);
+          font-size: 13px;
+          line-height: 1.6;
+        }
+
+        .upload-dropzone {
+          display: flex;
+          align-items: center;
+          gap: 17px;
+          padding: 24px;
+          border: 1.5px dashed #a7b8c9;
+          background: var(--an-surface-soft);
+          border-radius: 17px;
+          cursor: pointer;
+          transition: border-color 200ms ease, background 200ms ease;
+        }
+
+        .upload-dropzone:hover,
+        .upload-dropzone.is-dragging {
+          border-color: var(--an-accent);
+          background: var(--an-accent-soft);
+        }
+
+        .upload-icon-box {
+          display: grid;
+          place-items: center;
+          flex-shrink: 0;
+          width: 52px;
+          height: 52px;
+          color: var(--an-accent);
+          background: var(--an-accent-soft);
+          border-radius: 15px;
+        }
+
+        .upload-copy {
+          flex: 1;
+          min-width: 0;
+        }
+
+        .upload-copy strong {
+          display: block;
+          font-size: 14px;
+          font-weight: 800;
+          color: var(--an-text);
+          overflow-wrap: anywhere;
+        }
+
+        .upload-copy span {
+          display: block;
+          margin-top: 5px;
+          color: var(--an-muted);
+          font-size: 12px;
+          line-height: 1.6;
+        }
+
+        .upload-file-button {
+          flex-shrink: 0;
+          padding: 10px 14px;
+          border: 1px solid var(--an-border);
+          background: var(--an-surface);
+          color: var(--an-text);
+          border-radius: 11px;
+          font-size: 12px;
+          font-weight: 800;
+        }
+
+        .upload-preview-row {
+          display: flex;
+          align-items: center;
+          gap: 15px;
+          margin-top: 17px;
+          padding: 12px;
+          background: var(--an-surface-soft);
+          border: 1px solid var(--an-border);
+          border-radius: 15px;
+        }
+
+        .upload-preview-image {
+          width: 76px;
+          height: 76px;
+          border-radius: 11px;
+          object-fit: cover;
+          background: #020617;
+        }
+
+        .upload-preview-info {
+          flex: 1;
+          min-width: 0;
+        }
+
+        .upload-preview-info strong {
+          display: block;
+          color: var(--an-text);
+          font-size: 13px;
+          overflow-wrap: anywhere;
+        }
+
+        .upload-preview-info span {
+          display: block;
+          margin-top: 5px;
+          color: var(--an-muted);
+          font-size: 12px;
+        }
+
+        .primary-button,
+        .secondary-button,
+        .outline-button {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          gap: 9px;
+          padding: 12px 17px;
+          min-height: 43px;
+          border-radius: 12px;
+          font-size: 13px;
+          font-weight: 800;
+          cursor: pointer;
+          transition: transform 180ms ease, opacity 180ms ease,
+            background 180ms ease, border-color 180ms ease;
+        }
+
+        .primary-button {
+          border: 1px solid #059669;
+          background: #059669;
+          color: #ffffff;
+        }
+
+        .primary-button:hover:not(:disabled) {
+          background: #047857;
+          transform: translateY(-1px);
+        }
+
+        .secondary-button {
+          border: 1px solid var(--an-border);
+          background: var(--an-surface-soft);
+          color: var(--an-text);
+        }
+
+        .outline-button {
+          border: 1px solid var(--an-border);
+          background: transparent;
+          color: var(--an-text);
+        }
+
+        .primary-button:disabled,
+        .secondary-button:disabled,
+        .outline-button:disabled {
+          opacity: 0.5;
+          cursor: not-allowed;
+        }
+
+        .upload-actions {
+          display: flex;
+          justify-content: flex-end;
+          margin-top: 18px;
+        }
+
+        .error-banner {
+          display: flex;
+          align-items: flex-start;
+          gap: 10px;
+          padding: 13px 15px;
+          color: #b91c1c;
+          background: #fef2f2;
+          border: 1px solid #fecaca;
+          border-radius: 13px;
+          font-size: 13px;
+          line-height: 1.6;
+          overflow-wrap: anywhere;
+        }
+
+        .dark .dermascope-analyze-page .error-banner,
+        [data-theme="dark"] .dermascope-analyze-page .error-banner,
+        .dermascope-analyze-page.theme-dark .error-banner {
+          color: #fca5a5;
+          background: #351c28;
+          border-color: #713343;
+        }
+
+        .result-topline {
+          display: flex;
+          justify-content: space-between;
+          align-items: flex-start;
+          gap: 16px;
+          margin-bottom: 18px;
+        }
+
+        .result-label {
+          display: inline-flex;
+          align-items: center;
+          gap: 7px;
+          color: var(--an-accent);
+          font-size: 11px;
+          font-weight: 800;
+          letter-spacing: 0.1em;
+          text-transform: uppercase;
+        }
+
+        .result-prediction {
+          margin: 9px 0 0;
+          font-size: 25px;
+          font-weight: 800;
+          letter-spacing: -0.035em;
+          color: var(--an-text);
+          overflow-wrap: anywhere;
+        }
+
+        .result-meta {
+          color: var(--an-muted);
+          margin-top: 7px;
+          font-size: 12px;
+          line-height: 1.6;
+          overflow-wrap: anywhere;
+        }
+
+        .confidence-pill,
+        .visual-badge,
+        .mini-tag {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          gap: 6px;
+          flex-shrink: 0;
+          padding: 7px 10px;
+          color: var(--an-accent);
+          background: var(--an-accent-soft);
+          border: 1px solid rgba(16, 185, 129, 0.18);
+          border-radius: 999px;
+          font-size: 10px;
+          font-weight: 800;
+          letter-spacing: 0.035em;
+        }
+
+        .result-metrics {
+          display: grid;
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+          gap: 12px;
+          margin-top: 20px;
+        }
+
+        .result-metric {
+          padding: 15px;
+          background: var(--an-surface-soft);
+          border: 1px solid var(--an-border);
+          border-radius: 15px;
+          min-width: 0;
+        }
+
+        .metric-label {
+          display: block;
+          color: var(--an-muted);
+          font-size: 11px;
+          font-weight: 600;
+          line-height: 1.5;
+        }
+
+        .metric-value {
+          display: block;
+          margin-top: 6px;
+          color: var(--an-text);
+          font-size: 18px;
+          font-weight: 800;
+          overflow-wrap: anywhere;
+        }
+
+        .muted-text {
+          color: var(--an-muted);
+          font-size: 13px;
+          line-height: 1.7;
+        }
+
+        .visualization-section {
+          margin-top: 26px;
+        }
+
+        .visual-controls-card {
+          padding: 19px 21px;
+          margin-bottom: 18px;
+          background: var(--an-surface);
+          border: 1px solid var(--an-border);
+          border-radius: 18px;
+        }
+
+        .view-checkbox-list {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 10px;
+          margin-top: 16px;
+        }
+
+        .view-checkbox {
+          display: inline-flex;
+          align-items: center;
+          gap: 9px;
+          padding: 10px 13px;
+          background: var(--an-surface-soft);
+          border: 1px solid var(--an-border);
+          border-radius: 12px;
+          color: var(--an-text);
+          cursor: pointer;
+          transition: border-color 180ms ease, background 180ms ease;
+        }
+
+        .view-checkbox:has(input:checked) {
+          background: var(--an-accent-soft);
+          border-color: var(--an-accent);
+        }
+
+        .view-checkbox input {
+          width: 15px;
+          height: 15px;
+          accent-color: var(--an-accent);
+        }
+
+        .view-checkbox-copy strong {
+          display: block;
+          font-size: 12px;
+          font-weight: 800;
+        }
+
+        .view-checkbox-copy span {
+          display: block;
+          margin-top: 3px;
+          color: var(--an-muted);
+          font-size: 10px;
+        }
+
+        .visual-grid {
+          display: grid;
+          gap: 18px;
+          align-items: stretch;
+          transition: grid-template-columns 450ms cubic-bezier(.22, 1, .36, 1);
+        }
+
+        .visual-grid-3 {
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+        }
+
+        .visual-grid-2 {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .visual-grid-1 {
+          grid-template-columns: minmax(0, 760px);
+          justify-content: center;
+        }
+
+        .visual-grid-0 {
+          grid-template-columns: minmax(0, 1fr);
+        }
+
+        .visual-card {
+          min-width: 0;
+          padding: 17px;
+          border-radius: 20px;
+          background: var(--an-surface);
+          border: 1px solid var(--an-border);
+          box-shadow: var(--an-shadow);
+          opacity: 1;
+          transform: translateY(0);
+          animation: analyze-card-enter 400ms cubic-bezier(.22, 1, .36, 1);
+          transition: transform 300ms ease, border-color 300ms ease,
+            box-shadow 300ms ease, background 250ms ease;
+        }
+
+        .visual-card:hover {
+          transform: translateY(-3px);
+          border-color: rgba(16, 185, 129, 0.55);
+          box-shadow: 0 20px 40px rgba(16, 185, 129, 0.09);
+        }
+
+        @keyframes analyze-card-enter {
+          from {
+            opacity: 0;
+            transform: translateY(10px) scale(0.985);
+          }
+          to {
+            opacity: 1;
+            transform: translateY(0) scale(1);
+          }
+        }
+
+        .visual-card-heading {
+          display: flex;
+          justify-content: space-between;
+          align-items: flex-start;
+          gap: 10px;
+          margin-bottom: 13px;
+        }
+
+        .visual-heading-copy {
+          min-width: 0;
+        }
+
+        .visual-card-title {
+          margin: 0;
+          color: var(--an-text);
+          font-size: 15px;
+          font-weight: 800;
+          letter-spacing: -0.02em;
+          overflow-wrap: anywhere;
+        }
+
+        .visual-card-subtitle {
+          margin: 5px 0 0;
+          color: var(--an-muted);
+          font-size: 11px;
+          line-height: 1.6;
+        }
+
+        .visual-badge {
+          font-size: 9px;
+          padding: 6px 8px;
+        }
+
+        .visual-zoom-controls {
+          display: flex;
+          align-items: center;
+          justify-content: flex-end;
+          gap: 7px;
+          margin-bottom: 11px;
+        }
+
+        .visual-zoom-controls button {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          gap: 5px;
+          min-width: 32px;
+          height: 32px;
+          padding: 0 8px;
+          color: var(--an-text);
+          background: var(--an-surface-soft);
+          border: 1px solid var(--an-border);
+          border-radius: 9px;
+          cursor: pointer;
+          transition: background 180ms ease, border-color 180ms ease,
+            opacity 180ms ease;
+        }
+
+        .visual-zoom-controls button:hover:not(:disabled) {
+          background: var(--an-accent-soft);
+          border-color: var(--an-accent);
+        }
+
+        .visual-zoom-controls button:disabled {
+          opacity: 0.35;
+          cursor: not-allowed;
+        }
+
+        .zoom-percentage {
+          min-width: 43px;
+          text-align: center;
+          color: var(--an-muted);
+          font-size: 11px;
+          font-weight: 800;
+          font-variant-numeric: tabular-nums;
+        }
+
+        .zoom-reset-button {
+          font-size: 10px;
+          font-weight: 700;
+        }
+
+        .visual-image-area {
+          position: relative;
+          display: block;
+          width: 100%;
+          aspect-ratio: 1 / 1;
+          min-height: 0;
+          padding: 0;
+          overflow: hidden;
+          border: 0;
+          border-radius: 15px;
+          background: radial-gradient(
+            circle at 50% 35%,
+            #334155 0%,
+            #111827 65%,
+            #020617 100%
+          );
+          cursor: zoom-in;
+          isolation: isolate;
+        }
+
+        .binary-image-area {
+          background: #000000;
+        }
+
+        .visual-image-zoom-stage {
+          position: absolute;
+          inset: 0;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          overflow: hidden;
+        }
+
+        .visual-image {
+          display: block;
+          width: 100%;
+          height: 100%;
+          object-fit: fill;
+          transform-origin: center center;
+          transition: transform 220ms cubic-bezier(.22, 1, .36, 1);
+          user-select: none;
+          pointer-events: none;
+        }
+
+        .binary-mask-image {
+          image-rendering: auto;
+          object-fit: fill;
+          background: #000000;
+        }
+
+        .bbox-overlay {
+          position: absolute;
+          inset: 0;
+          width: 100%;
+          height: 100%;
+          overflow: hidden;
+          pointer-events: none;
+          transform: scale(var(--bbox-zoom, 1));
+          transform-origin: center center;
+        }
+
+        .visual-image-area:has(.bbox-overlay) .visual-image-zoom-stage {
+          --bbox-zoom: 1;
+        }
+
+        .visual-image-area:has(.bbox-overlay) .visual-image,
+        .visual-image-area:has(.bbox-overlay) .bbox-overlay {
+          transform: scale(var(--shared-image-zoom, 1));
+        }
+
+        .visual-image-area:has(.bbox-overlay) .visual-image-zoom-stage {
+          overflow: hidden;
+        }
+
+        .visual-image-area:has(.bbox-overlay) .visual-image {
+          transform: scale(var(--shared-image-zoom, 1));
+        }
+
+        .visual-placeholder {
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          justify-content: center;
+          gap: 9px;
+          height: 100%;
+          min-height: 230px;
+          color: #cbd5e1;
+          font-size: 12px;
+          padding: 22px;
+          text-align: center;
+        }
+
+        .visual-placeholder small {
+          color: #94a3b8;
+          font-size: 10px;
+          line-height: 1.6;
+        }
+
+        .image-expand-hint {
+          position: absolute;
+          bottom: 10px;
+          right: 10px;
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          padding: 7px 9px;
+          color: #f8fafc;
+          background: rgba(2, 6, 23, 0.75);
+          border: 1px solid rgba(255, 255, 255, 0.18);
+          border-radius: 9px;
+          font-size: 10px;
+          font-weight: 700;
+          opacity: 0;
+          transform: translateY(4px);
+          transition: opacity 180ms ease, transform 180ms ease;
+          pointer-events: none;
+        }
+
+        .visual-image-area:hover .image-expand-hint {
+          opacity: 1;
+          transform: translateY(0);
+        }
+
+        .visual-card-footer {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          gap: 10px;
+          padding-top: 14px;
+        }
+
+        .visual-card-footer .metric-value {
+          font-size: 14px;
+        }
+
+        .bbox-status {
+          display: inline-flex;
+          align-items: center;
+          gap: 7px;
+          color: var(--an-accent);
+          font-size: 10px;
+          font-weight: 800;
+        }
+
+        .bbox-status .status-dot {
+          width: 6px;
+          height: 6px;
+        }
+
+        .empty-views {
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          justify-content: center;
+          text-align: center;
+          padding: 42px 20px;
+          border: 1px dashed var(--an-border);
+          border-radius: 20px;
+          background: var(--an-surface);
+        }
+
+        .empty-views-icon {
+          display: grid;
+          place-items: center;
+          width: 52px;
+          height: 52px;
+          color: var(--an-accent);
+          background: var(--an-accent-soft);
+          border-radius: 16px;
+          margin-bottom: 15px;
+        }
+
+        .empty-views h3 {
+          margin: 0;
+          color: var(--an-text);
+          font-size: 17px;
+          font-weight: 800;
+        }
+
+        .empty-views p {
+          max-width: 420px;
+          margin: 8px 0 17px;
+          color: var(--an-muted);
+          font-size: 12px;
+          line-height: 1.7;
+        }
+
+        .derived-section {
+          margin-top: 28px;
+        }
+
+        .derived-grid {
+          display: grid;
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+          gap: 18px;
+        }
+
+        .derived-card {
+          min-width: 0;
+          padding: 17px;
+          background: var(--an-surface);
+          border: 1px solid var(--an-border);
+          border-radius: 20px;
+          box-shadow: var(--an-shadow);
+          transition: border-color 250ms ease, background 250ms ease;
+          animation: analyze-card-enter 400ms ease both;
+        }
+
+        .derived-card:nth-child(2) {
+          animation-delay: 60ms;
+        }
+
+        .derived-card:nth-child(3) {
+          animation-delay: 120ms;
+        }
+
+        .derived-card-heading {
+          min-height: 53px;
+          margin-bottom: 13px;
+        }
+
+        .derived-card-heading h3 {
+          margin: 0;
+          color: var(--an-text);
+          font-size: 15px;
+          font-weight: 800;
+        }
+
+        .derived-card-heading p {
+          margin: 5px 0 0;
+          color: var(--an-muted);
+          font-size: 11px;
+          line-height: 1.6;
+        }
+
+        .derived-image-area {
+          position: relative;
+          width: 100%;
+          aspect-ratio: 1 / 1;
+          overflow: hidden;
+          background: #020617;
+          border-radius: 15px;
+          padding: 0;
+          border: 0;
+          cursor: zoom-in;
+          display: block;
+        }
+
+        .derived-image-area img {
+          display: block;
+          width: 100%;
+          height: 100%;
+          object-fit: fill;
+          transform-origin: center center;
+          transition: transform 220ms ease;
+          pointer-events: none;
+        }
+
+        .derived-image-area .segmented-lesion-image {
+          object-fit: contain;
+          background: #020617;
+        }
+
+        .derived-footer {
+          margin-top: 12px;
+          color: var(--an-muted);
+          font-size: 11px;
+          line-height: 1.6;
+        }
+
+        .analytics-grid {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+          gap: 18px;
+          margin-top: 26px;
+        }
+
+        .probability-list {
+          display: flex;
+          flex-direction: column;
+          gap: 17px;
+          margin-top: 20px;
+        }
+
+        .probability-label-line {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          gap: 12px;
+          color: var(--an-text);
+          font-size: 12px;
+        }
+
+        .probability-label-line strong {
+          font-variant-numeric: tabular-nums;
+        }
+
+        .probability-track {
+          width: 100%;
+          height: 7px;
+          overflow: hidden;
+          background: var(--an-border);
+          border-radius: 999px;
+          margin-top: 8px;
+        }
+
+        .probability-fill {
+          height: 100%;
+          background: #94a3b8;
+          border-radius: 999px;
+          transition: width 600ms cubic-bezier(.22, 1, .36, 1);
+        }
+
+        .probability-fill-active {
+          background: linear-gradient(90deg, #059669, #34d399);
+        }
+
+        .localization-list {
+          display: flex;
+          flex-direction: column;
+          gap: 0;
+          margin-top: 12px;
+        }
+
+        .localization-row {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+          padding: 13px 0;
+          border-bottom: 1px solid var(--an-border);
+          font-size: 12px;
+        }
+
+        .localization-row:last-child {
+          border-bottom: 0;
+        }
+
+        .localization-row span {
+          color: var(--an-muted);
+        }
+
+        .localization-row strong {
+          color: var(--an-text);
+          font-weight: 800;
+          text-align: right;
+          overflow-wrap: anywhere;
+        }
+
+        .result-actions {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 10px;
+          margin-top: 22px;
+        }
+
+        .case-switcher {
+          min-width: 0;
+          max-width: 100%;
+          padding: 9px 12px;
+          color: var(--an-text);
+          background: var(--an-surface-soft);
+          border: 1px solid var(--an-border);
+          border-radius: 10px;
+          font-size: 12px;
+        }
+
+        .disclaimer {
+          margin-top: 24px;
+          padding: 15px 17px;
+          display: flex;
+          align-items: flex-start;
+          gap: 10px;
+          border: 1px solid var(--an-border);
+          border-radius: 14px;
+          background: var(--an-surface-soft);
+          color: var(--an-muted);
+          font-size: 11px;
+          line-height: 1.7;
+        }
+
+        .disclaimer strong {
+          color: var(--an-text);
+        }
+
+        .lightbox-backdrop {
+          position: fixed;
+          inset: 0;
+          z-index: 9999;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          padding: 24px;
+          background: rgba(2, 6, 23, 0.88);
+          backdrop-filter: blur(12px);
+          animation: lightbox-fade-in 180ms ease;
+        }
+
+        @keyframes lightbox-fade-in {
+          from { opacity: 0; }
+          to { opacity: 1; }
+        }
+
+        .lightbox-panel {
+          width: min(1050px, 100%);
+          max-height: 94vh;
+          display: flex;
+          flex-direction: column;
+          overflow: hidden;
+          background: #0f172a;
+          border: 1px solid rgba(148, 163, 184, 0.25);
+          border-radius: 20px;
+          box-shadow: 0 30px 100px rgba(0, 0, 0, 0.5);
+        }
+
+        .lightbox-toolbar {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          gap: 15px;
+          padding: 14px 18px;
+          background: #111c30;
+          border-bottom: 1px solid #263449;
+        }
+
+        .lightbox-heading {
+          min-width: 0;
+        }
+
+        .lightbox-heading h3 {
+          margin: 0;
+          color: #f8fafc;
+          font-size: 15px;
+          font-weight: 800;
+          overflow-wrap: anywhere;
+        }
+
+        .lightbox-heading p {
+          margin: 5px 0 0;
+          color: #94a3b8;
+          font-size: 11px;
+        }
+
+        .lightbox-toolbar-actions {
+          display: flex;
+          align-items: center;
+          justify-content: flex-end;
+          gap: 8px;
+          flex-wrap: wrap;
+        }
+
+        .lightbox-toolbar .visual-zoom-controls {
+          margin: 0;
+        }
+
+        .lightbox-toolbar .visual-zoom-controls button {
+          color: #e2e8f0;
+          background: #1e293b;
+          border-color: #334155;
+        }
+
+        .lightbox-toolbar .zoom-percentage {
+          color: #cbd5e1;
+        }
+
+        .lightbox-close {
+          display: grid;
+          place-items: center;
+          width: 35px;
+          height: 35px;
+          flex-shrink: 0;
+          color: #f8fafc;
+          background: #1e293b;
+          border: 1px solid #334155;
+          border-radius: 10px;
+          cursor: pointer;
+        }
+
+        .lightbox-image-stage {
+          position: relative;
+          flex: 1;
+          min-height: 280px;
+          overflow: auto;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          padding: 18px;
+          background: radial-gradient(circle, #1e293b 0%, #020617 80%);
+        }
+
+        .lightbox-image-wrapper {
+          position: relative;
+          flex: 0 0 auto;
+          width: min(75vh, 850px);
+          max-width: 100%;
+          aspect-ratio: 1 / 1;
+          overflow: hidden;
+          background: #020617;
+          border-radius: 10px;
+        }
+
+        .lightbox-image-wrapper img {
+          display: block;
+          width: 100%;
+          height: 100%;
+          object-fit: fill;
+          transform-origin: center center;
+          transition: transform 180ms ease;
+          pointer-events: none;
+        }
+
+        .lightbox-image-wrapper .lightbox-bbox {
+          position: absolute;
+          inset: 0;
+          width: 100%;
+          height: 100%;
+          pointer-events: none;
+        }
+
+        .lightbox-footer {
+          padding: 10px 18px;
+          color: #94a3b8;
+          background: #111c30;
+          border-top: 1px solid #263449;
+          font-size: 11px;
+          line-height: 1.6;
+        }
+
+        .loading-indicator {
+          display: inline-block;
+          width: 15px;
+          height: 15px;
+          border: 2px solid rgba(255, 255, 255, 0.45);
+          border-top-color: white;
+          border-radius: 999px;
+          animation: analyze-spin 650ms linear infinite;
+        }
+
+        @keyframes analyze-spin {
+          to { transform: rotate(360deg); }
+        }
+
+        @media (max-width: 1100px) {
+          .visual-grid-3,
+          .derived-grid {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+          }
+
+          .analytics-grid {
+            grid-template-columns: 1fr;
+          }
+        }
+
+        @media (max-width: 720px) {
+          .dermascope-analyze-page {
+            padding: 14px;
+            border-radius: 14px;
+          }
+
+          .analyze-header {
+            flex-direction: column;
+          }
+
+          .analyze-header-tag {
+            align-self: flex-start;
+          }
+
+          .upload-card,
+          .result-card,
+          .section-card {
+            padding: 15px;
+            border-radius: 17px;
+          }
+
+          .upload-dropzone {
+            flex-wrap: wrap;
+            padding: 16px;
+          }
+
+          .upload-file-button {
+            margin-left: 68px;
+          }
+
+          .upload-actions .primary-button {
+            width: 100%;
+          }
+
+          .result-topline {
+            flex-direction: column;
+          }
+
+          .result-metrics {
+            grid-template-columns: 1fr;
+          }
+
+          .visual-grid-3,
+          .visual-grid-2,
+          .visual-grid-1,
+          .derived-grid {
+            grid-template-columns: minmax(0, 1fr);
+          }
+
+          .visual-card {
+            padding: 14px;
+          }
+
+          .derived-card {
+            padding: 14px;
+          }
+
+          .visual-card-title {
+            font-size: 14px;
+          }
+
+          .zoom-reset-button span {
+            display: none;
+          }
+
+          .result-actions {
+            flex-direction: column;
+          }
+
+          .result-actions button {
+            width: 100%;
+          }
+
+          .lightbox-backdrop {
+            padding: 8px;
+          }
+
+          .lightbox-panel {
+            max-height: 96vh;
+            border-radius: 14px;
+          }
+
+          .lightbox-toolbar {
+            align-items: flex-start;
+            padding: 11px;
+          }
+
+          .lightbox-toolbar-actions {
+            gap: 5px;
+          }
+
+          .lightbox-toolbar .visual-zoom-controls {
+            gap: 4px;
+          }
+
+          .lightbox-toolbar .zoom-reset-button {
+            display: none;
+          }
+
+          .lightbox-image-stage {
+            padding: 8px;
+          }
+
+          .lightbox-image-wrapper {
+            width: min(82vw, 70vh);
+          }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+          .dermascope-analyze-page *,
+          .dermascope-analyze-page *::before,
+          .dermascope-analyze-page *::after {
+            animation-duration: 0.01ms !important;
+            transition-duration: 0.01ms !important;
+          }
+        }
+      `}</style>
+
+      <header className="analyze-header">
+        <div>
+          <div className="analyze-kicker">
+            <Icon name="sparkles" size={15} />
+            AI-POWERED DERMATOLOGY
+          </div>
+
+          <h1 className="analyze-title">Skin Analysis</h1>
+
+          <p className="analyze-description">
+            Upload a skin lesion image to generate a classification,
+            model-attention heatmap, and U-Net lesion localization views.
+          </p>
+        </div>
+
+        <div className="analyze-header-tag">
+          <span className="status-dot" />
+          <span>Analysis workspace</span>
+        </div>
+      </header>
+
+      <div className="analyze-stack">
+        {error && (
+          <div className="error-banner" role="alert">
+            <Icon name="alert" size={18} />
+            <span>{error}</span>
+          </div>
+        )}
+
+        {/* Upload stays above the results; these sections are never side-by-side. */}
+        <section className="upload-card">
+          <div className="section-heading">
+            <div>
+              <h2 className="section-title">Upload lesion image</h2>
+              <p className="section-description">
+                Use a clear JPG, PNG, or WebP image. Maximum file size: 10 MB.
+              </p>
+            </div>
+          </div>
+
+          <input
+            ref={inputRef}
+            type="file"
+            accept="image/jpeg,image/png,image/webp"
+            onChange={handleFileInput}
+            hidden
+          />
+
+          <div
+            className={`upload-dropzone ${dragging ? "is-dragging" : ""}`}
+            onDragOver={(event) => {
+              event.preventDefault();
+              setDragging(true);
+            }}
+            onDragLeave={() => setDragging(false)}
+            onDrop={handleDrop}
+            onClick={() => inputRef.current?.click()}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                inputRef.current?.click();
+              }
+            }}
+            role="button"
+            tabIndex={0}
+            aria-label="Choose or drop a skin lesion image"
           >
-            {hasResult ? '✓' : '•'}
-          </span>
+            <div className="upload-icon-box">
+              <Icon name="upload" size={25} />
+            </div>
 
-          Classifier (EfficientNetV2S)
+            <div className="upload-copy">
+              <strong>
+                {selectedFile ? selectedFile.name : "Drop your image here"}
+              </strong>
+              <span>
+                {selectedFile
+                  ? "Select another image or run the analysis below."
+                  : "Drag and drop an image, or browse files from your computer."}
+              </span>
+            </div>
 
-          <span className="font-mono text-[var(--muted)]">
-            {hasResult
-              ? `${result.inferenceTime ?? '—'}s`
-              : 'ready'}
-          </span>
-
-        </div>
-
-        <div className="flex items-center gap-1.5 text-[12px] px-3 py-1.5 border border-[var(--line)] rounded-full bg-[var(--panel)]">
-
-          <span
-            className={`w-3.5 h-3.5 rounded-full text-white flex items-center justify-center text-[9px] ${
-              hasResult
-                ? 'bg-[var(--teal)]'
-                : 'bg-[var(--muted)]'
-            }`}
-          >
-            {hasResult ? '✓' : '•'}
-          </span>
-
-          Localization (U-Net)
-
-          <span className="font-mono text-[var(--muted)]">
-            {hasResult ? 'complete' : 'ready'}
-          </span>
-
-        </div>
-
-      </div>
-
-      {/* ====================================================== */}
-      {/* ERROR */}
-      {/* ====================================================== */}
-
-      {error && (
-        <div className="mb-4 border border-[var(--line)] bg-[var(--gold-dim)] rounded-[3px] px-3.5 py-3 text-[12px]">
-          <div className="font-bold text-[var(--gold)] mb-1">
-            Unable to continue
+            <span className="upload-file-button">Browse files</span>
           </div>
 
-          <div className="text-[var(--muted)]">
-            {error}
-          </div>
-        </div>
-      )}
+          {previewUrl && selectedFile && (
+            <div className="upload-preview-row">
+              <img
+                src={previewUrl}
+                alt="Selected lesion preview"
+                className="upload-preview-image"
+              />
 
-      {/* ====================================================== */}
-      {/* MAIN GRID */}
-      {/* ====================================================== */}
-
-      <div className="grid grid-cols-1 lg:grid-cols-[1.15fr_1fr] gap-[18px]">
-
-        {/* ==================================================== */}
-        {/* IMAGE PANEL */}
-        {/* ==================================================== */}
-
-        <div className="bg-[var(--panel)] border border-[var(--line)] rounded-[3px] overflow-hidden">
-
-          {/* Header */}
-
-          <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--line)]">
-
-            <h3 className="text-[13px] font-bold m-0">
-              Input image
-            </h3>
-
-            <span className="text-[11px] text-[var(--muted)] font-mono truncate max-w-[220px]">
-              {selectedFile
-                ? selectedFile.name
-                : 'No image selected'}
-            </span>
-
-          </div>
-
-          {/* ================================================== */}
-          {/* UPLOAD */}
-          {/* ================================================== */}
-
-          <div className="px-4 pt-3.5">
-
-            <div
-              onDragOver={handleDragOver}
-              onDragLeave={handleDragLeave}
-              onDrop={handleDrop}
-              onClick={openFilePicker}
-              role="button"
-              tabIndex={0}
-              onKeyDown={(event) => {
-                if (
-                  event.key === 'Enter' ||
-                  event.key === ' '
-                ) {
-                  openFilePicker();
-                }
-              }}
-              className={`border border-dashed rounded-[3px] p-4 mb-3.5 flex items-center justify-between gap-3 text-[12.5px] cursor-pointer transition-colors ${
-                isDragging
-                  ? 'border-[var(--teal)] bg-[var(--teal-dim)]'
-                  : 'border-[var(--line)] hover:border-[var(--teal)]'
-              }`}
-            >
-
-              <div className="min-w-0">
-
-                <div className="text-[var(--ink)] font-medium">
-                  {isDragging
-                    ? 'Drop image here'
-                    : selectedFile
-                      ? 'Image selected'
-                      : 'Drag an image here or click to browse'}
-                </div>
-
-                <div className="text-[11px] text-[var(--muted)] mt-1">
-                  JPG, PNG, WebP · maximum 10 MB
-                </div>
-
+              <div className="upload-preview-info">
+                <strong>{selectedFile.name}</strong>
+                <span>
+                  {(selectedFile.size / (1024 * 1024)).toFixed(2)} MB · Ready
+                  for analysis
+                </span>
               </div>
 
               <button
                 type="button"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  openFilePicker();
-                }}
-                className="shrink-0 text-[12px] px-3 py-1.5 rounded-full border border-[var(--line)] bg-transparent cursor-pointer hover:border-[var(--teal)]"
+                className="outline-button"
+                onClick={() => inputRef.current?.click()}
               >
-                Choose image
+                Change
               </button>
-
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="image/jpeg,image/jpg,image/png,image/webp"
-                onChange={handleFileChange}
-                className="hidden"
-              />
-
             </div>
+          )}
 
-            {/* Selected file information */}
+          <div className="upload-actions">
+            <button
+              type="button"
+              className="primary-button"
+              onClick={handleAnalyze}
+              disabled={!selectedFile || loading}
+            >
+              {loading ? (
+                <>
+                  <span className="loading-indicator" />
+                  Analyzing image…
+                </>
+              ) : (
+                <>
+                  <Icon name="scan" size={17} />
+                  Analyze image
+                </>
+              )}
+            </button>
+          </div>
+        </section>
 
-            {selectedFile && (
-              <div className="flex items-center justify-between gap-3 mb-3.5 px-3 py-2 border border-[var(--line)] rounded-[3px]">
+        {loading && (
+          <section className="result-card" aria-live="polite">
+            <div className="result-label">
+              <span className="status-dot" />
+              ANALYSIS IN PROGRESS
+            </div>
+            <h2 className="section-title" style={{ marginTop: 12 }}>
+              Processing your image
+            </h2>
+            <p className="muted-text">
+              The classifier, Grad-CAM generator, and lesion segmentation
+              pipeline are processing the uploaded image.
+            </p>
+          </section>
+        )}
 
-                <div className="min-w-0">
-
-                  <div className="text-[12px] font-medium truncate">
-                    {selectedFile.name}
-                  </div>
-
-                  <div className="text-[10.5px] text-[var(--muted)] font-mono mt-0.5">
-                    {(selectedFile.size / 1024 / 1024).toFixed(2)} MB
-                    {imageDimensions &&
-                      ` · ${imageDimensions.width}×${imageDimensions.height}`}
-                  </div>
-
+        {result && !loading && (
+          <section className="result-card">
+            <div className="result-topline">
+              <div>
+                <div className="result-label">
+                  <Icon name="check" size={15} />
+                  ANALYSIS COMPLETE
                 </div>
 
-                <button
-                  type="button"
-                  onClick={handleRemoveImage}
-                  className="shrink-0 text-[11px] px-2.5 py-1 rounded-full border border-[var(--line)] bg-transparent cursor-pointer"
-                >
-                  Remove
-                </button>
+                <h2 className="result-prediction">{result.prediction}</h2>
 
+                <p className="result-meta">
+                  File: {result.fileName}
+                  {result.scanId != null && ` · Scan #${result.scanId}`}
+                </p>
+              </div>
+
+              <span className="confidence-pill">
+                Confidence {formatConfidence(result.confidence)}
+              </span>
+            </div>
+
+            <div className="result-metrics">
+              <div className="result-metric">
+                <span className="metric-label">Predicted class</span>
+                <strong className="metric-value">{result.prediction}</strong>
+              </div>
+
+              <div className="result-metric">
+                <span className="metric-label">Affected area</span>
+                <strong className="metric-value">
+                  {formatPercent(result.localization.areaAffectedPercent)}
+                </strong>
+              </div>
+
+              <div className="result-metric">
+                <span className="metric-label">Inference latency</span>
+                <strong className="metric-value">
+                  {result.inferenceTime != null
+                    ? `${Number(result.inferenceTime).toFixed(0)} ms`
+                    : "—"}
+                </strong>
+              </div>
+            </div>
+
+            {caseOptions.length > 1 && (
+              <div style={{ marginTop: 18 }}>
+                <label
+                  htmlFor="dermascope-case-switcher"
+                  className="metric-label"
+                  style={{ marginBottom: 7 }}
+                >
+                  Recent analysis cases
+                </label>
+
+                <select
+                  id="dermascope-case-switcher"
+                  className="case-switcher"
+                  value={selectedCase}
+                  onChange={handleCaseChange}
+                >
+                  {caseOptions.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      {item.fileName} — {item.prediction}
+                    </option>
+                  ))}
+                </select>
               </div>
             )}
 
-          </div>
-
-          {/* ================================================== */}
-          {/* IMAGE / RESULT VISUALIZATION */}
-          {/* ================================================== */}
-
-          <div className="flex gap-1.5 px-4 pb-3">
-
-            {['single', 'split'].map((m) => (
+            <div className="result-actions">
               <button
-                key={m}
                 type="button"
-                onClick={() => setMode(m)}
-                disabled={!selectedFile}
-                className={`font-mono text-[11px] px-2.5 py-1 border rounded-[4px] cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
-                  mode === m
-                    ? 'bg-[var(--ink)] text-[var(--paper)] border-[var(--ink)]'
-                    : 'bg-[var(--panel)] text-[var(--muted)] border-[var(--line)]'
-                }`}
+                className="secondary-button"
+                onClick={handleFlagForReview}
+                disabled={reviewFlagged}
               >
-                {m === 'single'
-                  ? 'Single overlay'
-                  : 'Compare side-by-side'}
+                <Icon name="flag" size={16} />
+                {reviewFlagged ? "Flagged for review" : "Flag for review"}
               </button>
-            ))}
 
-          </div>
-
-          {/* ================================================== */}
-          {/* SINGLE MODE */}
-          {/* ================================================== */}
-
-          {mode === 'single' ? (
-
-            <LesionPhoto
-              className="aspect-[4/3] mx-4 mb-3.5 rounded-md"
-              style={{
-                background: '#1b1410',
-              }}
-            >
-
-              {imageUrl ? (
-                <img
-                  src={imageUrl}
-                  alt="Uploaded lesion"
-                  className="absolute inset-0 w-full h-full object-contain"
-                />
-              ) : (
-                <div className="absolute inset-0 flex items-center justify-center text-[12px] text-[var(--muted)]">
-                  Upload a lesion image to begin
-                </div>
-              )}
-
-              {/* Grad-CAM */}
-
-              {result.gradcamUrl && (
-                <img
-                  src={result.gradcamUrl}
-                  alt="Grad-CAM visualization"
-                  className={`absolute inset-0 w-full h-full object-contain pointer-events-none ${
-                    overlay === 'heat'
-                      ? 'opacity-70'
-                      : 'opacity-0'
-                  }`}
-                />
-              )}
-
-              {/* U-Net mask */}
-
-              {result.maskUrl && (
-                <img
-                  src={result.maskUrl}
-                  alt="U-Net lesion mask"
-                  className={`absolute inset-0 w-full h-full object-contain pointer-events-none ${
-                    overlay === 'mask'
-                      ? 'opacity-50'
-                      : 'opacity-0'
-                  }`}
-                />
-              )}
-
-              {/* Bounding box */}
-
-              {result.boundingBox && (
-                <div
-                  className={`absolute border-2 border-[var(--teal)] pointer-events-none ${
-                    overlay === 'box'
-                      ? 'opacity-100'
-                      : 'opacity-0'
-                  }`}
-                  style={getBoundingBoxStyle()}
-                />
-              )}
-
-              {/* Overlay buttons */}
-
-              {selectedFile && (
-                <div className="absolute left-2.5 bottom-2.5 flex gap-1.5 flex-wrap z-[2]">
-
-                  {OVERLAYS.map((item) => {
-
-                    const available =
-                      item.key === 'heat'
-                        ? Boolean(result.gradcamUrl)
-                        : item.key === 'mask'
-                          ? Boolean(result.maskUrl)
-                          : Boolean(result.boundingBox);
-
-                    return (
-                      <button
-                        key={item.key}
-                        type="button"
-                        disabled={!available}
-                        onClick={() =>
-                          setOverlay(item.key)
-                        }
-                        className={`font-mono text-[10.5px] px-2.5 py-1.5 rounded-full cursor-pointer border disabled:opacity-40 disabled:cursor-not-allowed ${
-                          overlay === item.key
-                            ? 'bg-[var(--teal)] border-[var(--teal)] text-white'
-                            : 'bg-black/70 border-white/25 text-[#e9efec]'
-                        }`}
-                      >
-                        {item.label}
-                      </button>
-                    );
-                  })}
-
-                </div>
-              )}
-
-            </LesionPhoto>
-
-          ) : (
-
-            /* ================================================= */
-            /* SPLIT MODE */
-            /* ================================================= */
-
-            <div className="grid grid-cols-2 gap-0.5 mx-4 mb-3.5 rounded-md overflow-hidden bg-[var(--line)] aspect-[4/3]">
-
-              <LesionPhoto>
-
-                {imageUrl && (
-                  <img
-                    src={imageUrl}
-                    alt="Original lesion"
-                    className="absolute inset-0 w-full h-full object-contain"
-                  />
-                )}
-
-                {result.gradcamUrl && (
-                  <img
-                    src={result.gradcamUrl}
-                    alt="Grad-CAM"
-                    className="absolute inset-0 w-full h-full object-contain opacity-70"
-                  />
-                )}
-
-                <span className="absolute top-2 left-2 font-mono text-[10px] bg-black/70 text-white px-1.5 py-0.5 rounded-full z-[2]">
-                  Grad-CAM · Model 1
-                </span>
-
-              </LesionPhoto>
-
-              <LesionPhoto>
-
-                {imageUrl && (
-                  <img
-                    src={imageUrl}
-                    alt="Original lesion"
-                    className="absolute inset-0 w-full h-full object-contain"
-                  />
-                )}
-
-                {result.maskUrl && (
-                  <img
-                    src={result.maskUrl}
-                    alt="U-Net mask"
-                    className="absolute inset-0 w-full h-full object-contain opacity-50"
-                  />
-                )}
-
-                <span className="absolute top-2 left-2 font-mono text-[10px] bg-black/70 text-white px-1.5 py-0.5 rounded-full z-[2]">
-                  U-Net mask · Model 2
-                </span>
-
-              </LesionPhoto>
-
-            </div>
-          )}
-
-          {/* ================================================== */}
-          {/* EXPLANATION */}
-          {/* ================================================== */}
-
-          <div className="px-4 pb-4 text-[11px] text-[var(--muted)] flex gap-3.5 flex-wrap">
-
-            <span>
-              <b className="text-[var(--clay)]">●</b>{' '}
-              Grad-CAM —{' '}
-              <b className="text-[var(--ink)]">
-                Model 1
-              </b>
-              , EfficientNetV2S classifier. It provides an
-              approximate visualization of regions influencing the
-              classification.
-            </span>
-
-            <span>
-              <b className="text-[var(--teal)]">●</b>{' '}
-              Mask / Bounding box —{' '}
-              <b className="text-[var(--ink)]">
-                Model 2
-              </b>
-              , U-Net. It provides lesion localization.
-            </span>
-
-          </div>
-
-          {/* ================================================== */}
-          {/* ANALYZE BUTTON */}
-          {/* ================================================== */}
-
-          <div className="px-4 pb-4">
-
-            <button
-              type="button"
-              onClick={handleAnalyze}
-              disabled={!selectedFile || isAnalyzing}
-              className="w-full font-bold text-[13px] px-4 py-2.5 rounded-full border border-[var(--ink)] bg-[var(--ink)] text-[var(--paper)] cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-            >
-              {isAnalyzing
-                ? 'Analyzing image…'
-                : selectedFile
-                  ? 'Analyze image'
-                  : 'Upload an image to analyze'}
-            </button>
-
-          </div>
-
-        </div>
-
-        {/* ==================================================== */}
-        {/* RESULT PANEL */}
-        {/* ==================================================== */}
-
-        <div className="bg-[var(--panel)] border border-[var(--line)] rounded-[3px] overflow-hidden h-fit">
-
-          {/* Header */}
-
-          <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--line)]">
-
-            <h3 className="text-[13px] font-bold m-0">
-              Result
-            </h3>
-
-            <span className="text-[11px] text-[var(--muted)] font-mono">
-              {formattedInferenceTime}
-            </span>
-
-          </div>
-
-          {/* ================================================== */}
-          {/* NO RESULT */}
-          {/* ================================================== */}
-
-          {!hasResult && (
-            <div className="px-4 py-8 text-center border-b border-[var(--line)]">
-
-              <div className="text-[13px] font-bold mb-1">
-                No analysis yet
-              </div>
-
-              <div className="text-[11.5px] text-[var(--muted)] leading-[1.5]">
-                Upload a dermoscopic image and select{' '}
-                <b>Analyze image</b>. The classifier and
-                localization results will appear here.
-              </div>
-
-            </div>
-          )}
-
-          {/* ================================================== */}
-          {/* RESULT */}
-          {/* ================================================== */}
-
-          {hasResult && (
-            <>
-              {/* Prediction */}
-
-              <div className="flex justify-between gap-3.5 px-4 py-4 border-b border-[var(--line)]">
-
-                <div className="min-w-0">
-
-                  <p className="text-[11px] text-[var(--muted)] m-0 mb-1">
-                    Predicted condition
-                  </p>
-
-                  <p className="text-[21px] font-extrabold tracking-tight m-0 text-[var(--clay)] break-words">
-                    {result.prediction}
-                  </p>
-
-                </div>
-
-                <div
-                  className="gauge shrink-0"
-                  style={{
-                    background:
-                      result.confidence !== null
-                        ? `conic-gradient(var(--teal) 0% ${Math.max(
-                            0,
-                            Math.min(
-                              100,
-                              result.confidence
-                            )
-                          )}%, var(--teal-dim) ${Math.max(
-                            0,
-                            Math.min(
-                              100,
-                              result.confidence
-                            )
-                          )}% 100%)`
-                        : 'var(--teal-dim)',
-                  }}
-                >
-                  <span>
-                    {formattedConfidence}
-                  </span>
-                </div>
-
-              </div>
-
-              {/* All classes */}
-
-              <div className="px-4 py-3.5 border-b border-[var(--line)]">
-
-                <h4 className="text-[11.5px] text-[var(--muted)] font-bold m-0 mb-2.5">
-                  All classes
-                </h4>
-
-                {result.probabilities.length === 0 ? (
-                  <div className="text-[11px] text-[var(--muted)]">
-                    Class probabilities were not returned by the
-                    backend.
-                  </div>
-                ) : (
-                  result.probabilities.map((item) => (
-
-                    <div
-                      key={item.label}
-                      className="grid grid-cols-[110px_1fr_44px] items-center gap-2.5 mb-1.5 text-[12px]"
-                    >
-
-                      <span className="truncate" title={item.label}>
-                        {item.label}
-                      </span>
-
-                      <div className="h-[5px] bg-[var(--teal-dim)] rounded-[3px] overflow-hidden">
-
-                        <span
-                          className="block h-full bg-[var(--teal)]"
-                          style={{
-                            width: `${Math.max(
-                              0,
-                              Math.min(
-                                100,
-                                item.pct
-                              )
-                            )}%`,
-                          }}
-                        />
-
-                      </div>
-
-                      <span className="font-mono text-right text-[var(--muted)]">
-                        {item.pct.toFixed(1)}%
-                      </span>
-
-                    </div>
-
-                  ))
-                )}
-
-              </div>
-
-              {/* Localization */}
-
-              <div className="grid grid-cols-2 gap-2.5 px-4 py-3.5 border-b border-[var(--line)]">
-
-                <h4 className="col-span-2 text-[11.5px] text-[var(--muted)] font-bold m-0">
-                  Localization (U-Net)
-                </h4>
-
-                {result.localization.length === 0 ? (
-                  <div className="col-span-2 text-[11px] text-[var(--muted)]">
-                    Localization statistics were not returned by
-                    the backend.
-                  </div>
-                ) : (
-                  result.localization.map((item) => (
-
-                    <div
-                      key={item.label}
-                      className="border border-[var(--line)] rounded-[3px] px-2.5 py-2"
-                    >
-
-                      <div className="text-[10.5px] text-[var(--muted)] mb-1">
-                        {item.label}
-                      </div>
-
-                      <div className="font-mono text-[14px] font-semibold">
-                        {item.value}
-                      </div>
-
-                    </div>
-
-                  ))
-                )}
-
-              </div>
-
-              {/* Why prediction */}
-
-              <details
-                className="px-4 py-3.5 border-b border-[var(--line)]"
-                open
+              <button
+                type="button"
+                className="outline-button"
+                onClick={handleExportReport}
+                disabled={exporting}
               >
+                <Icon name="download" size={16} />
+                {exporting ? "Preparing report…" : "Export PDF report"}
+              </button>
+            </div>
+          </section>
+        )}
+      </div>
 
-                <summary className="cursor-pointer text-[11.5px] text-[var(--muted)] font-bold list-none marker:hidden">
-                  ▾ Why this prediction
-                </summary>
-
-                <p className="text-[12.5px] leading-[1.55] mt-2">
-                  <b>Model 1 (classifier)</b> predicts the disease
-                  class and confidence. Grad-CAM is used as an
-                  approximate visualization of regions influencing
-                  the classifier.
+      {result && !loading && (
+        <>
+          <section className="visualization-section">
+            <div className="section-heading">
+              <div>
+                <h2 className="section-title">AI visualization workspace</h2>
+                <p className="section-description">
+                  Select the views you want to compare. Zoom controls on each
+                  card work independently.
                 </p>
+              </div>
+            </div>
 
-                <p className="text-[12.5px] leading-[1.55] mt-2">
-                  <b>Model 2 (U-Net)</b> is a separate localization
-                  model. Its predicted mask is used to identify the
-                  lesion region and derive localization measurements.
+            <div className="visual-controls-card">
+              <h3 className="section-title" style={{ fontSize: 14 }}>
+                Visualization filters
+              </h3>
+
+              <div className="view-checkbox-list">
+                {VIEW_OPTIONS.map((option) => (
+                  <label className="view-checkbox" key={option.id}>
+                    <input
+                      type="checkbox"
+                      checked={selectedViews.includes(option.id)}
+                      onChange={() => toggleView(option.id)}
+                    />
+
+                    <span className="view-checkbox-copy">
+                      <strong>{option.label}</strong>
+                      <span>{option.description}</span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            {selectedViews.length === 0 ? (
+              <div className="empty-views">
+                <div className="empty-views-icon">
+                  <Icon name="image" size={25} />
+                </div>
+                <h3>No visualization selected</h3>
+                <p>
+                  Enable one or more visualization cards to inspect the
+                  model&apos;s attention and the segmented lesion.
                 </p>
-
-                {result.overlap !== null && (
-                  <p className="text-[12.5px] leading-[1.55] mt-2">
-                    The calculated overlap between the Grad-CAM
-                    region and U-Net localization is{' '}
-                    <b>
-                      {result.overlap.toFixed(1)}%
-                    </b>
-                    .
-                  </p>
+                <button
+                  type="button"
+                  className="primary-button"
+                  onClick={() => setSelectedViews(DEFAULT_VIEWS)}
+                >
+                  Restore default views
+                </button>
+              </div>
+            ) : (
+              <div className={gridClass}>
+                {selectedViews.includes("gradcam") && (
+                  <VisualCard
+                    key="gradcam"
+                    cardId="gradcam"
+                    title="Grad-CAM"
+                    subtitle="Regions influencing the model prediction."
+                    imageUrl={gradcamUrl}
+                    result={result}
+                    zoom={getCardZoom("gradcam")}
+                    onZoomIn={() => changeCardZoom("gradcam", 0.25)}
+                    onZoomOut={() => changeCardZoom("gradcam", -0.25)}
+                    onResetZoom={() => resetCardZoom("gradcam")}
+                    onOpen={openLightbox}
+                    type="gradcam"
+                    badge="AI ATTENTION"
+                    isDark={isDark}
+                  />
                 )}
 
-              </details>
+                {selectedViews.includes("binary-mask") && (
+                  <VisualCard
+                    key="binary-mask"
+                    cardId="binary-mask"
+                    title="Binary Mask"
+                    subtitle="Foreground lesion pixels from U-Net."
+                    imageUrl={binaryMaskUrl}
+                    result={result}
+                    zoom={getCardZoom("binary-mask")}
+                    onZoomIn={() => changeCardZoom("binary-mask", 0.25)}
+                    onZoomOut={() => changeCardZoom("binary-mask", -0.25)}
+                    onResetZoom={() => resetCardZoom("binary-mask")}
+                    onOpen={openLightbox}
+                    type="binary-mask"
+                    badge="U-NET MASK"
+                    isDark={isDark}
+                  />
+                )}
 
-              {/* Manual review */}
+                {selectedViews.includes("bounding-box") && (
+                  <div
+                    style={{
+                      "--shared-image-zoom": getCardZoom("bounding-box"),
+                      minWidth: 0,
+                    }}
+                  >
+                    <VisualCard
+                      key="bounding-box"
+                      cardId="bounding-box"
+                      title="Bounding Box"
+                      subtitle="Tight outline around the detected mask region."
+                      imageUrl={previewUrl}
+                      result={result}
+                      zoom={getCardZoom("bounding-box")}
+                      onZoomIn={() => changeCardZoom("bounding-box", 0.25)}
+                      onZoomOut={() => changeCardZoom("bounding-box", -0.25)}
+                      onResetZoom={() => resetCardZoom("bounding-box")}
+                      onOpen={openLightbox}
+                      type="bounding-box"
+                      bbox={bbox}
+                      badge="LOCALIZATION"
+                      isDark={isDark}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+          </section>
 
-              <div className="px-4 py-3 flex items-center gap-2 text-[12px] text-[var(--muted)] border-b border-[var(--line)]">
+          {/* This U-Net section is deliberately separate from the toggle grid. */}
+          <section className="derived-section">
+            <div className="section-heading">
+              <div>
+                <h2 className="section-title">U-Net Derived View</h2>
+                <p className="section-description">
+                  Compare the source image, binary segmentation mask, and
+                  isolated lesion region.
+                </p>
+              </div>
 
-                <span>⚑</span>
+              <span className="visual-badge">SEGMENTATION OUTPUT</span>
+            </div>
 
-                Unsure about this result?
+            <div className="derived-grid">
+              <article className="derived-card">
+                <div className="derived-card-heading">
+                  <h3>Original</h3>
+                  <p>Uploaded skin lesion image.</p>
+                </div>
+
+                <ZoomControls
+                  zoom={getCardZoom("unet-original")}
+                  onZoomIn={() => changeCardZoom("unet-original", 0.25)}
+                  onZoomOut={() => changeCardZoom("unet-original", -0.25)}
+                  onReset={() => resetCardZoom("unet-original")}
+                />
 
                 <button
                   type="button"
-                  onClick={handleFlagReview}
-                  disabled={isFlagging}
-                  className="text-[var(--teal)] ml-auto bg-transparent border-0 cursor-pointer disabled:opacity-40"
+                  className="derived-image-area"
+                  onClick={() =>
+                    openLightbox({
+                      cardId: "unet-original",
+                      title: "Original",
+                      imageUrl: previewUrl,
+                      type: "image",
+                    })
+                  }
+                  aria-label="Enlarge original image"
                 >
-                  {isFlagging
-                    ? 'Flagging…'
-                    : 'Flag for manual review'}
+                  {previewUrl && (
+                    <img
+                      src={previewUrl}
+                      alt="Original lesion"
+                      style={{
+                        transform: `scale(${getCardZoom("unet-original")})`,
+                      }}
+                    />
+                  )}
                 </button>
 
+                <p className="derived-footer">
+                  Source image used for classification and segmentation.
+                </p>
+              </article>
+
+              <article className="derived-card">
+                <div className="derived-card-heading">
+                  <h3>Binary Mask</h3>
+                  <p>White foreground on a black background.</p>
+                </div>
+
+                <ZoomControls
+                  zoom={getCardZoom("unet-mask")}
+                  onZoomIn={() => changeCardZoom("unet-mask", 0.25)}
+                  onZoomOut={() => changeCardZoom("unet-mask", -0.25)}
+                  onReset={() => resetCardZoom("unet-mask")}
+                />
+
+                <button
+                  type="button"
+                  className="derived-image-area"
+                  onClick={() =>
+                    openLightbox({
+                      cardId: "unet-mask",
+                      title: "Binary Mask",
+                      imageUrl: binaryMaskUrl,
+                      type: "binary-mask",
+                    })
+                  }
+                  aria-label="Enlarge binary mask"
+                >
+                  {binaryMaskUrl && (
+                    <img
+                      src={binaryMaskUrl}
+                      alt="U-Net binary mask"
+                      style={{
+                        transform: `scale(${getCardZoom("unet-mask")})`,
+                      }}
+                    />
+                  )}
+                </button>
+
+                <p className="derived-footer">
+                  Pixels selected by the U-Net segmentation output.
+                </p>
+              </article>
+
+              <article className="derived-card">
+                <div className="derived-card-heading">
+                  <h3>Segmented Lesion</h3>
+                  <p>
+                    Isolated lesion region generated from the U-Net binary
+                    mask.
+                  </p>
+                </div>
+
+                <ZoomControls
+                  zoom={getCardZoom("segmented-lesion")}
+                  onZoomIn={() =>
+                    changeCardZoom("segmented-lesion", 0.25)
+                  }
+                  onZoomOut={() =>
+                    changeCardZoom("segmented-lesion", -0.25)
+                  }
+                  onReset={() => resetCardZoom("segmented-lesion")}
+                />
+
+                <button
+                  type="button"
+                  className="derived-image-area"
+                  onClick={() =>
+                    openLightbox({
+                      cardId: "segmented-lesion",
+                      title: "Segmented Lesion",
+                      imageUrl: segmentedLesionUrl,
+                      type: "segmented-lesion",
+                    })
+                  }
+                  aria-label="Enlarge segmented lesion"
+                >
+                  {segmentedLesionUrl ? (
+                    <img
+                      src={segmentedLesionUrl}
+                      alt="Isolated segmented lesion"
+                      className="segmented-lesion-image"
+                      style={{
+                        transform: `scale(${getCardZoom("segmented-lesion")})`,
+                      }}
+                    />
+                  ) : (
+                    <div className="visual-placeholder">
+                      <Icon name="scan" size={26} />
+                      <span>Preparing segmented lesion…</span>
+                    </div>
+                  )}
+                </button>
+
+                <p className="derived-footer">
+                  Pixels outside the predicted lesion mask are transparent.
+                </p>
+              </article>
+            </div>
+          </section>
+
+          <section className="analytics-grid">
+            <div className="section-card">
+              <div className="section-heading">
+                <div>
+                  <h2 className="section-title">Class probabilities</h2>
+                  <p className="section-description">
+                    Confidence distribution returned by the classifier.
+                  </p>
+                </div>
               </div>
 
-            </>
-          )}
-
-          {/* ================================================== */}
-          {/* ACTION MESSAGE */}
-          {/* ================================================== */}
-
-          {actionMessage && (
-            <div className="px-4 py-2.5 text-[11px] text-[var(--muted)] border-b border-[var(--line)]">
-              {actionMessage}
+              {renderProbabilities()}
             </div>
-          )}
 
-          {/* ================================================== */}
-          {/* ACTION BUTTONS */}
-          {/* ================================================== */}
+            <div className="section-card">
+              <div className="section-heading">
+                <div>
+                  <h2 className="section-title">Localization metrics</h2>
+                  <p className="section-description">
+                    Measurements calculated from the U-Net mask.
+                  </p>
+                </div>
+              </div>
 
-          <div className="px-4 py-3.5 flex gap-2 flex-wrap">
+              <div className="localization-list">
+                <div className="localization-row">
+                  <span>Affected area</span>
+                  <strong>
+                    {formatPercent(result.localization.areaAffectedPercent)}
+                  </strong>
+                </div>
 
-            <button
-              type="button"
-              onClick={handleDownloadReport}
-              disabled={!hasResult}
-              className="font-bold text-[13px] px-4 py-2 rounded-full border border-[var(--ink)] bg-[var(--ink)] text-[var(--paper)] cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-            >
-              Download report (PDF)
-            </button>
+                <div className="localization-row">
+                  <span>Lesion pixels</span>
+                  <strong>
+                    {result.localization.areaPixels != null
+                      ? formatNumber(result.localization.areaPixels)
+                      : "—"}
+                  </strong>
+                </div>
 
-            <button
-              type="button"
-              onClick={handleSaveHistory}
-              disabled={!hasResult || isSaving}
-              className="font-bold text-[13px] px-4 py-2 rounded-full border border-[var(--line)] bg-transparent text-[var(--ink)] cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-            >
-              {isSaving
-                ? 'Saving…'
-                : 'Save to history'}
-            </button>
+                <div className="localization-row">
+                  <span>Perimeter</span>
+                  <strong>
+                    {result.localization.perimeterPixels != null
+                      ? `${Number(
+                          result.localization.perimeterPixels
+                        ).toFixed(2)} px`
+                      : "—"}
+                  </strong>
+                </div>
 
+                <div className="localization-row">
+                  <span>Bounding box</span>
+                  <strong>
+                    {bbox
+                      ? `${Math.round(bbox.width)} × ${Math.round(
+                          bbox.height
+                        )} px`
+                      : "Not detected"}
+                  </strong>
+                </div>
+
+                <div className="localization-row">
+                  <span>Coordinate space</span>
+                  <strong>224 × 224 px</strong>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <div className="disclaimer">
+            <Icon name="alert" size={17} />
+            <div>
+              <strong>Clinical disclaimer:</strong> This AI-generated
+              classification and segmentation are intended for research and
+              decision support, not as a standalone medical diagnosis.
+              Confidence scores are model outputs and do not establish the
+              presence or absence of a disease. Consult a qualified healthcare
+              professional for clinical assessment.
+            </div>
           </div>
+        </>
+      )}
 
+      {lightbox && (
+        <div
+          className="lightbox-backdrop"
+          onClick={closeLightbox}
+          role="presentation"
+        >
+          <div
+            className="lightbox-panel"
+            onClick={(event) => event.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+            aria-label={`${lightbox.title} enlarged view`}
+          >
+            <div className="lightbox-toolbar">
+              <div className="lightbox-heading">
+                <h3>{lightbox.title}</h3>
+                <p>Use zoom controls to inspect image details.</p>
+              </div>
+
+              <div className="lightbox-toolbar-actions">
+                <ZoomControls
+                  zoom={lightboxZoom}
+                  compact
+                  onZoomIn={() =>
+                    setLightboxZoom((zoom) => clamp(zoom + 0.25, 1, 4))
+                  }
+                  onZoomOut={() =>
+                    setLightboxZoom((zoom) => clamp(zoom - 0.25, 1, 4))
+                  }
+                  onReset={() => setLightboxZoom(1)}
+                />
+
+                <button
+                  type="button"
+                  className="lightbox-close"
+                  onClick={closeLightbox}
+                  aria-label="Close enlarged image"
+                  title="Close"
+                >
+                  <Icon name="close" size={19} />
+                </button>
+              </div>
+            </div>
+
+            <div className="lightbox-image-stage">
+              <div className="lightbox-image-wrapper">
+                <img
+                  src={lightbox.imageUrl}
+                  alt={lightbox.title}
+                  style={{
+                    transform: `scale(${lightboxZoom})`,
+                  }}
+                />
+
+                {lightbox.type === "bounding-box" && bbox && (
+                  <svg
+                    className="lightbox-bbox"
+                    viewBox={`0 0 ${IMAGE_SIZE} ${IMAGE_SIZE}`}
+                    preserveAspectRatio="none"
+                  >
+                    <rect
+                      x={bbox.x}
+                      y={bbox.y}
+                      width={bbox.width}
+                      height={bbox.height}
+                      fill="none"
+                      stroke="#00ff88"
+                      strokeWidth="1.8"
+                      vectorEffect="non-scaling-stroke"
+                    />
+                  </svg>
+                )}
+              </div>
+            </div>
+
+            <div className="lightbox-footer">
+              Zoom: {Math.round(lightboxZoom * 100)}% · Press + or − to zoom,
+              0 to reset, or Escape to close.
+            </div>
+          </div>
         </div>
-
-      </div>
-    </div>
+      )}
+    </main>
   );
 }

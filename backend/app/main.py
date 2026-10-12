@@ -1,35 +1,65 @@
-
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.db.database import Base, engine
+
+from app.api.analyze import router as analyze_router
+from app.api.history import router as history_router
+from app.api.compare import router as compare_router
+
+
+Base.metadata.create_all(bind=engine)
+
+
 app = FastAPI(
-    title="Dermascope API",
-    description="AI-powered skin image analysis backend",
-    version="1.0.0"
+    title="DermaScope API",
+    version="1.0.0",
+)
+app.mount(
+    "/storage",
+    StaticFiles(directory="storage"),
+    name="storage",
 )
 
-# Allow requests from the Next.js frontend
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Restrict this later to your frontend URL
+    allow_origins=[
+        "http://localhost:3000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+
+app.include_router(
+    analyze_router,
+    prefix="/api",
+)
+
+app.include_router(
+    history_router,
+    prefix="/api",
+)
+
+app.include_router(
+    compare_router,
+    prefix="/api",
+)
+
+
 @app.get("/")
 def root():
     return {
-        "message": "Dermascope API is running",
-        "status": "success"
+        "message": "DermaScope API is running"
     }
 
 
 @app.get("/health")
-def health_check():
+def health():
     return {
-        "status": "healthy",
-        "service": "Dermascope Backend"
+        "status": "ok"
     }
-
